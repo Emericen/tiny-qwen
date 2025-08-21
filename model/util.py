@@ -7,7 +7,6 @@ from huggingface_hub import snapshot_download, logging
 from accelerate import init_empty_weights, load_checkpoint_and_dispatch
 
 
-from .model import ModelConfig
 from .vision import VisionConfig
 
 logging.set_verbosity_error()
@@ -129,10 +128,13 @@ def load_pretrained_model(
     with open(model_path / "config.json", "r") as f:
         config_data = json.load(f)
 
-    llm_config = _convert_llm_config(config_data)
-    llm_config = _filter_dict_by_dataclass(llm_config, ModelConfig)
+    # Get the appropriate config class from the model
+    config_cls = model_cls.get_config_class()
 
-    model_config = ModelConfig(**llm_config)
+    llm_config = _convert_llm_config(config_data)
+    llm_config = _filter_dict_by_dataclass(llm_config, config_cls)
+
+    model_config = config_cls(**llm_config)
     if "vision_config" in config_data:
         vision_config = _convert_vision_config(config_data)
         vision_config = _filter_dict_by_dataclass(vision_config, VisionConfig)

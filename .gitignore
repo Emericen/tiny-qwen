@@ -10,5 +10,6 @@ venv
 test.py
 textbook/
 .env
+.claude/
 transformers/
 tokenizers/

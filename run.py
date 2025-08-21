@@ -12,7 +12,8 @@ from rich.text import Text
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
 from model.processor import Processor
-from model.model import Qwen2VL, Qwen3, Qwen3MoE
+from model.qwen2_5_vl import Qwen2VL
+from model.qwen3 import Qwen3Dense, Qwen3MoE
 
 ASCII_LOGO = """
 ██╗    ████████╗██╗███╗   ██╗██╗   ██╗    ██████╗ ██╗    ██╗███████╗███╗   ██╗
@@ -69,11 +70,11 @@ REPO_ID_TO_MODEL_CLASS = {
     "Qwen/Qwen2.5-VL-32B-Instruct": Qwen2VL,
     "Qwen/Qwen2.5-VL-72B-Instruct": Qwen2VL,
     "Qwen/Qwen3-0.6B": Qwen3MoE,
-    "Qwen/Qwen3-1.7B": Qwen3,
+    "Qwen/Qwen3-1.7B": Qwen3Dense,
     "Qwen/Qwen3-4B": Qwen3MoE,
-    "Qwen/Qwen3-8B": Qwen3,
-    "Qwen/Qwen3-14B": Qwen3,
-    "Qwen/Qwen3-32B": Qwen3,
+    "Qwen/Qwen3-8B": Qwen3Dense,
+    "Qwen/Qwen3-14B": Qwen3Dense,
+    "Qwen/Qwen3-32B": Qwen3Dense,
     "Qwen/Qwen3-4B-Instruct-2507": Qwen3MoE,
     "Qwen/Qwen3-30B-A3B-Instruct-2507": Qwen3MoE,
     "Qwen/Qwen3-235B-A22B-Instruct-2507": Qwen3MoE,
