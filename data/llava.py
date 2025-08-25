@@ -20,7 +20,7 @@ def setup_cache(base_url, jsonl_filename, images_filename, cache_dir="./cache"):
     os.makedirs(cache_dir, exist_ok=True)
 
     jsonl_path = os.path.join(cache_dir, jsonl_filename)
-    images_dir = os.path.join(cache_dir, images_filename.replace(".tar", "_images"))
+    images_dir = os.path.join(cache_dir, jsonl_filename.replace(".jsonl", "_images"))
 
     _download_file_if_needed(f"{base_url}/{jsonl_filename}", jsonl_path, "JSONL")
     _download_and_extract_images_if_needed(
@@ -28,6 +28,25 @@ def setup_cache(base_url, jsonl_filename, images_filename, cache_dir="./cache"):
     )
 
     return jsonl_path, images_dir
+
+
+def _transform_message_content(content, image_filename):
+    """Transform message content from string with <image> tokens to list format."""
+    if "<image>" not in content:
+        return [{"type": "text", "content": content}]
+
+    parts = content.split("<image>")
+    result = []
+
+    for i, part in enumerate(parts):
+        if part.strip():  # Add text part if not empty
+            result.append({"type": "text", "content": part})
+
+        # Add image part after each text part except the last
+        if i < len(parts) - 1:
+            result.append({"type": "image", "content": image_filename})
+
+    return result
 
 
 def _download_file_if_needed(url, filepath, desc):
@@ -78,7 +97,18 @@ class LLaVAPretrainDataset(Dataset):
         item = self.data[idx]
         image_path = os.path.join(self.images_dir, item["image"])
         image = Image.open(image_path)
-        return {"image": image, "messages": item["messages"], "id": item["id"]}
+
+        # Transform messages to list format
+        transformed_messages = []
+        for message in item["messages"]:
+            transformed_content = _transform_message_content(
+                message["content"], image_path
+            )
+            transformed_messages.append(
+                {"role": message["role"], "content": transformed_content}
+            )
+
+        return {"image": image, "messages": transformed_messages, "id": item["id"]}
 
 
 class LLaVAInstructDataset(Dataset):
@@ -98,7 +128,18 @@ class LLaVAInstructDataset(Dataset):
         item = self.data[idx]
         image_path = os.path.join(self.images_dir, item["image"])
         image = Image.open(image_path)
-        return {"image": image, "messages": item["messages"], "id": item["id"]}
+
+        # Transform messages to list format
+        transformed_messages = []
+        for message in item["messages"]:
+            transformed_content = _transform_message_content(
+                message["content"], image_path
+            )
+            transformed_messages.append(
+                {"role": message["role"], "content": transformed_content}
+            )
+
+        return {"image": image, "messages": transformed_messages, "id": item["id"]}
 
 
 if __name__ == "__main__":

@@ -114,9 +114,9 @@ class Processor:
                     elif isinstance(content, list):
                         for item in content:
                             if item["type"] == "text":
-                                result.append(item["text"])
+                                result.append(item["content"])
                             elif item["type"] == "image":
-                                result.extend(["<|vision_start|>", Image.open(item["image"]), "<|vision_end|>"])
+                                result.extend(["<|vision_start|>", Image.open(item["content"]), "<|vision_end|>"])
                     result.append("<|im_end|>\n")
                 elif message["role"] == "assistant":
                     result.append(f"<|im_start|>assistant\n{message['content']}<|im_end|>\n")
