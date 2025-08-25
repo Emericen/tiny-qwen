@@ -7,6 +7,8 @@ from model.processor import Processor
 from model.vision import VisionConfig, Qwen2VLVisionEncoder
 from model.qwen3 import Qwen3Config, Qwen3Dense
 
+from data.llava import LLaVAPretrainDataset, LLaVAInstructDataset
+
 
 class Qwen3V(nn.Module):
     def __init__(self, vision_config: VisionConfig, lm_config: Qwen3Config):
@@ -139,42 +141,6 @@ if __name__ == "__main__":
     }
     qwen3_1_7B_lm_config = Qwen3Config(**qwen3_1_7B_lm_config_dict)
 
-    # Qwen3 8B's lm config:
-    qwen3_8B_lm_config_dict = {
-        "n_embed": 4096,
-        "n_heads": 32,
-        "n_kv_heads": 8,
-        "n_layer": 36,
-        "n_mlp": 12288,
-        "rope_theta": 1000000,
-        "rms_norm_eps": 1e-06,
-        "vocab_size": 151936,
-        "tie_word_embeddings": False,
-        "head_dim": 128,
-        "num_experts": None,
-        "num_experts_per_tok": None,
-        "moe_intermediate_size": None,
-    }
-    qwen3_8B_lm_config = Qwen3Config(**qwen3_8B_lm_config_dict)
-
-    # Qwen3 14B's lm config:
-    qwen3_14B_lm_config_dict = {
-        "n_embed": 5120,
-        "n_heads": 40,
-        "n_kv_heads": 8,
-        "n_layer": 40,
-        "n_mlp": 17408,
-        "rope_theta": 1000000,
-        "rms_norm_eps": 1e-06,
-        "vocab_size": 151936,
-        "tie_word_embeddings": False,
-        "head_dim": 128,
-        "num_experts": None,
-        "num_experts_per_tok": None,
-        "moe_intermediate_size": None,
-    }
-    qwen3_14B_lm_config = Qwen3Config(**qwen3_14B_lm_config_dict)
-
     processor = Processor(
         repo_id="Qwen/Qwen2.5-VL-7B-Instruct",
         vision_config=qwen2_5_VL_7B_vision_config,
@@ -185,17 +151,21 @@ if __name__ == "__main__":
     )
     model = model.cuda()  # Move model to CUDA
 
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "what is in this image?"},
-                {"type": "image", "image": "data/test-img-1.jpg"},
-            ],
-        }
-    ]
-    inputs = processor(messages, device="cuda")
 
+    pretrain_dataset = LLaVAPretrainDataset(
+        processor=processor,
+        data_dir="data/llava/pretrain",
+        max_length=1024,
+    )
+    # instruct_dataset = LLaVAInstructDataset(
+    #     processor=processor,
+    #     data_dir="data/llava/instruct",
+    #     max_length=1024,
+    # )
+
+    messages = pretrain_dataset[0]["messages"]
+
+    inputs = processor(messages=messages, device="cuda")
     print("Input shapes:")
     print(f"input_ids: {inputs['input_ids'].shape}")
     print(f"pixels: {inputs['pixels']}")  # Should be None for text-only
@@ -210,22 +180,3 @@ if __name__ == "__main__":
             d_image=inputs["d_image"],
         )
         print(f"Output logits shape: {logits.shape}")
-
-
-"""
-
-Datasets
-
-Images:
-- https://huggingface.co/datasets/liuhaotian/LLaVA-CC3M-Pretrain-595K
-- https://huggingface.co/datasets/liuhaotian/LLaVA-Instruct-150K
-
-Videos:
-- https://huggingface.co/datasets/OpenGVLab/InternVid-Full?utm_source=chatgpt.com
-- https://huggingface.co/datasets/HuggingFaceM4/howto100m
-
-Agent:
-- https://huggingface.co/datasets/ONE-Lab/GUI-World/tree/main
-    - https://huggingface.co/datasets/ONE-Lab/GUI-World/tree/main/Annotation/train
-
-"""
