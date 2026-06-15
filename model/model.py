@@ -42,6 +42,61 @@ class ModelConfig:
     partial_rotary_factor: float = 1.0
 
 
+class KVCache:
+    """Cache for standard attention layers - stores K/V tensors."""
+
+    def __init__(self, n_layers):
+        self.cache = [None] * n_layers
+
+    def update(self, layer_idx, k, v):
+        if self.cache[layer_idx] is not None:
+            prev_k, prev_v = self.cache[layer_idx]
+            k = torch.cat([prev_k, k], dim=2)
+            v = torch.cat([prev_v, v], dim=2)
+        self.cache[layer_idx] = (k, v)
+        return k, v
+
+    @property
+    def seq_len(self):
+        if self.cache[0] is None:
+            return 0
+        return self.cache[0][0].shape[2]
+
+
+class DeltaNetCache:
+    """Cache for GatedDeltaNet layers - stores recurrent state S and conv state."""
+
+    def __init__(self, n_layers):
+        self.cache = [None] * n_layers
+        self.conv_cache = [None] * n_layers
+
+    def get(self, layer_idx):
+        return self.cache[layer_idx]
+
+    def update(self, layer_idx, S):
+        self.cache[layer_idx] = S
+
+    def get_conv(self, layer_idx):
+        return self.conv_cache[layer_idx]
+
+    def update_conv(self, layer_idx, state):
+        self.conv_cache[layer_idx] = state
+
+
+class InferenceCache:
+    """Unified cache for both attention types."""
+
+    def __init__(self, config):
+        self.kv_cache = KVCache(config.n_layer)
+        self.delta_cache = DeltaNetCache(config.n_layer)
+        self.config = config
+
+    @staticmethod
+    def alloc(config, batch_size, device):
+        cache = InferenceCache(config)
+        return cache
+
+
 class RotaryEmbedding(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -95,7 +150,7 @@ class SelfAttention(nn.Module):
         self.q_norm = GemmaRMSNorm(self.d_head, eps=config.rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.d_head, eps=config.rms_norm_eps)
 
-    def forward(self, x, cos, sin):
+    def forward(self, x, cos, sin, kv_cache=None, layer_idx=None):
         B, T, _ = x.size()
 
         # split q_proj output into query and gate
@@ -109,12 +164,16 @@ class SelfAttention(nn.Module):
 
         q, k = self._apply_partial_rotary_pos_emb(q, k, cos, sin)
 
+        if kv_cache is not None:
+            k, v = kv_cache.update(layer_idx, k, v)
+
         if self.n_kv_heads < self.n_heads:
             num_repeat = self.n_heads // self.n_kv_heads
             k = k.repeat_interleave(num_repeat, dim=1)
             v = v.repeat_interleave(num_repeat, dim=1)
 
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        is_causal = T > 1 and (kv_cache is None or kv_cache.seq_len == T)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
         y = y.transpose(1, 2).contiguous().view(B, T, self.n_heads * self.d_head)
         y = y * torch.sigmoid(gate)
         y = self.o_proj(y)
@@ -170,11 +229,19 @@ class GatedDeltaNet(nn.Module):
         self.A_log = nn.Parameter(torch.empty(self.n_v_heads).uniform_(0, 16).log())
         self.norm = RMSNormGated(self.d_v, eps=config.rms_norm_eps)
 
-    def forward(self, x):
+    def forward(self, x, cache=None, layer_idx=None):
         B, T, _ = x.shape
+
+        if cache is not None and T == 1:
+            return self._step(x, cache, layer_idx)
 
         # project + causal conv1d with SiLU
         qkv = self.in_proj_qkv(x)
+
+        if cache is not None:
+            K = self.conv1d.weight.shape[2]
+            cache.update_conv(layer_idx, qkv[:, -(K - 1):, :].detach().transpose(1, 2))
+
         qkv = F.silu(self.conv1d(qkv.transpose(1, 2))[:, :, :T]).transpose(1, 2)
 
         z = self.in_proj_z(x).view(B, T, self.n_v_heads, self.d_v)
@@ -196,14 +263,88 @@ class GatedDeltaNet(nn.Module):
             k = k.repeat_interleave(r, dim=2)
 
         # delta rule attention
-        y = self._gated_delta_rule(q, k, v, g, beta)
+        y, S_final = self._gated_delta_rule(q, k, v, g, beta)
+
+        # cache final state for inference
+        if cache is not None:
+            cache.update(layer_idx, S_final)
 
         # gated output norm + project
         y = self.norm(y.reshape(-1, self.d_v), z.reshape(-1, self.d_v))
         return self.out_proj(y.view(B, T, -1))
 
+    def _step(self, x, cache, layer_idx):
+        """Single-token inference step with persistent state."""
+        B, T, _ = x.shape
+        assert T == 1, "Step mode only supports single token"
+
+        z = self.in_proj_z(x).view(B, T, self.n_v_heads, self.d_v)
+        beta = self.in_proj_b(x).sigmoid()
+        g = -self.A_log.float().exp() * F.softplus(
+            self.in_proj_a(x).float() + self.dt_bias
+        )
+
+        qkv = self.in_proj_qkv(x)
+        conv_state = cache.get_conv(layer_idx)  # (B, conv_dim, K-1)
+        new_qkv = qkv.transpose(1, 2)           # (B, conv_dim, 1)
+        conv_input = torch.cat([conv_state, new_qkv], dim=2)  # (B, conv_dim, K)
+        cache.update_conv(layer_idx, conv_input[:, :, 1:])
+        qkv = F.silu((self.conv1d.weight.squeeze(1) * conv_input).sum(-1)).unsqueeze(1)
+
+        q, k, v = torch.split(qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+        q = q.view(B, T, self.n_k_heads, self.d_k)
+        k = k.view(B, T, self.n_k_heads, self.d_k)
+        v = v.view(B, T, self.n_v_heads, self.d_v)
+
+        # GQA expansion
+        if self.n_v_heads > self.n_k_heads:
+            r = self.n_v_heads // self.n_k_heads
+            q = q.repeat_interleave(r, dim=2)
+            k = k.repeat_interleave(r, dim=2)
+
+        # single-step delta rule with cached state
+        y = self._gated_delta_rule_step(q, k, v, g, beta, cache, layer_idx)
+
+        # gated output norm + project
+        y = self.norm(y.reshape(-1, self.d_v), z.reshape(-1, self.d_v))
+        return self.out_proj(y.view(B, T, -1))
+
+    def _gated_delta_rule_step(self, q, k, v, g, beta, cache, layer_idx):
+        """Single step of gated delta rule with persistent state."""
+        out_dtype = q.dtype
+        q = q.transpose(1, 2).contiguous().float()
+        k = k.transpose(1, 2).contiguous().float()
+        v = v.transpose(1, 2).contiguous().float()
+        beta = beta.transpose(1, 2).contiguous().float()
+        g = g.transpose(1, 2).contiguous().float()
+
+        q = self._l2norm(q) / (q.shape[-1] ** 0.5)
+        k = self._l2norm(k)
+
+        B, H, T, d_k = k.shape
+        d_v = v.shape[-1]
+
+        # Get or initialize state
+        S = cache.get(layer_idx)
+        if S is None:
+            S = torch.zeros(B, H, d_k, d_v, device=v.device, dtype=v.dtype)
+
+        q_t, k_t, v_t = q[:, :, 0], k[:, :, 0], v[:, :, 0]
+        g_t = g[:, :, 0].exp().unsqueeze(-1).unsqueeze(-1)
+        beta_t = beta[:, :, 0].unsqueeze(-1)
+
+        S = S * g_t
+        delta = (v_t - (S * k_t.unsqueeze(-1)).sum(-2)) * beta_t
+        S = S + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
+        out = (S * q_t.unsqueeze(-1)).sum(-2)
+
+        # Update cache
+        cache.update(layer_idx, S)
+
+        return out.unsqueeze(2).to(out_dtype)
+
     def _gated_delta_rule(self, q, k, v, g, beta):
-        """Recurrent gated delta rule with L2-normalized Q, K."""
+        """Recurrent gated delta rule with L2-normalized Q, K. Returns (output, final_state)."""
         out_dtype = q.dtype
         q, k, v, beta, g = [
             x.transpose(1, 2).contiguous().float() for x in (q, k, v, beta, g)
@@ -226,7 +367,7 @@ class GatedDeltaNet(nn.Module):
             S = S + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
             out[:, :, t] = (S * q_t.unsqueeze(-1)).sum(-2)
 
-        return out.transpose(1, 2).contiguous().to(out_dtype)
+        return out.transpose(1, 2).contiguous().to(out_dtype), S
 
     @staticmethod
     def _l2norm(x, eps=1e-6):
@@ -401,11 +542,17 @@ class Block(nn.Module):
 
         self.mlp = MoEMLP(config) if config.n_experts else DenseMLP(config)
 
-    def forward(self, x, cos, sin):
+    def forward(self, x, cos, sin, cache=None, layer_idx=None):
         if self.layer_type == "linear_attention":
-            x = x + self.linear_attn(self.input_layernorm(x))
+            x = x + self.linear_attn(
+                self.input_layernorm(x), cache=cache.delta_cache if cache else None, layer_idx=layer_idx
+            )
         else:
-            x = x + self.self_attn(self.input_layernorm(x), cos, sin)
+            x = x + self.self_attn(
+                self.input_layernorm(x), cos, sin,
+                kv_cache=cache.kv_cache if cache else None,
+                layer_idx=layer_idx,
+            )
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x
 
@@ -427,13 +574,14 @@ class Model(nn.Module):
         vision_embed=None,
         vision_mask=None,
         position_ids=None,
+        cache=None,
     ):
         if vision_embed is not None and vision_mask is not None:
             input_embed[vision_mask] = vision_embed
 
         cos, sin = self.rotary_emb(input_embed, position_ids)
-        for layer in self.layers:
-            input_embed = layer(input_embed, cos, sin)
+        for layer_idx, layer in enumerate(self.layers):
+            input_embed = layer(input_embed, cos, sin, cache=cache, layer_idx=layer_idx)
 
         input_embed = self.norm(input_embed)
         return input_embed
@@ -461,9 +609,12 @@ class Qwen3_5(nn.Module):
         input_ids: torch.Tensor,
         pixels: Optional[torch.Tensor] = None,
         d_image: Optional[torch.Tensor] = None,
+        cache: Optional[InferenceCache] = None,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         input_embeds = self.model.language_model.embed_tokens(input_ids)
-        position_ids = self._get_position_ids(input_ids=input_ids, d_image=d_image)
+        if position_ids is None:
+            position_ids = self._get_position_ids(input_ids=input_ids, d_image=d_image)
 
         if pixels is not None:
             pixels = pixels.to(input_embeds.dtype)
@@ -483,10 +634,11 @@ class Qwen3_5(nn.Module):
                 vision_embed=vision_embed,
                 vision_mask=vision_mask,
                 position_ids=position_ids,
+                cache=cache,
             )
         else:
             output = self.model.language_model(
-                input_embed=input_embeds, position_ids=position_ids
+                input_embed=input_embeds, position_ids=position_ids, cache=cache
             )
 
         logits = (
@@ -644,13 +796,21 @@ class Qwen3_5(nn.Module):
             stop_tokens = [248046, 248045, 248044]
 
         self.eval()
-        generated_ids = input_ids
+        device = input_ids.device
+        B = input_ids.shape[0]
 
         with torch.no_grad():
+            cache = InferenceCache.alloc(self.config, B, device)
+
+            position_ids = self._get_position_ids(input_ids=input_ids, d_image=d_image)
+            logits = self.forward(
+                input_ids=input_ids, pixels=pixels, d_image=d_image,
+                cache=cache, position_ids=position_ids,
+            )
+            next_pos = position_ids.max().item() + 1
+            generated_ids = input_ids
+
             for _ in range(max_new_tokens):
-                logits = self.forward(
-                    input_ids=generated_ids, pixels=pixels, d_image=d_image
-                )
                 last_logits = logits[:, -1, :]
                 probs = F.softmax(last_logits, dim=-1)
                 next_token = probs.argmax(dim=-1, keepdim=True)
@@ -661,6 +821,12 @@ class Qwen3_5(nn.Module):
 
                 if token_id in stop_tokens:
                     break
+
+                decode_pos = torch.full((3, B, 1), next_pos, dtype=torch.long, device=device)
+                logits = self.forward(
+                    input_ids=next_token, cache=cache, position_ids=decode_pos,
+                )
+                next_pos += 1
 
     def generate(
         self,

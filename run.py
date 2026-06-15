@@ -1,6 +1,7 @@
 import os
 import re
 import io
+import time
 import warnings
 import logging
 import torch
@@ -148,13 +149,23 @@ def generate_local_response(messages, model, processor, max_tokens=2048):
     token_generator = model.generate_stream(**generation_kwargs)
     generated_tokens = []
     previous_text = ""
+    start_time = None
     for token_id in token_generator:
+        if start_time is None:
+            start_time = time.time()
         generated_tokens.append(token_id)
         current_text = processor.tokenizer.decode(generated_tokens)
         new_text = current_text[len(previous_text) :]
         if new_text:
             previous_text = current_text
             yield new_text
+
+    # Calculate and return generation stats
+    end_time = time.time()
+    num_tokens = len(generated_tokens)
+    elapsed = end_time - start_time if start_time else 0
+    tokens_per_sec = num_tokens / elapsed if elapsed > 0 else 0
+    yield {"stats": {"tokens": num_tokens, "elapsed": elapsed, "tok_per_sec": tokens_per_sec}}
 
 
 @app.command()
@@ -213,7 +224,13 @@ def main():
             }
         ]
         while True:
-            user_input = input("\nUSER: ").strip()
+            user_input = questionary.text("USER: ", qmark="").ask()
+
+            if user_input is None:
+                console.print("Goodbye!")
+                break
+
+            user_input = user_input.strip()
 
             if user_input == "/exit":
                 console.print("Goodbye!")
@@ -230,9 +247,13 @@ def main():
             try:
                 response_segments = []
                 print("QWEN: ", end="", flush=True)
+                stats = None
                 for segment in generate_local_response(messages, model, processor):
-                    print(segment, end="", flush=True)
-                    response_segments.append(segment)
+                    if isinstance(segment, dict) and "stats" in segment:
+                        stats = segment["stats"]
+                    else:
+                        print(segment, end="", flush=True)
+                        response_segments.append(segment)
                 response = "".join(response_segments)
                 messages.append(
                     {
@@ -241,6 +262,11 @@ def main():
                     }
                 )
                 print()
+                if stats:
+                    console.print(
+                        f"[dim]Generated {stats['tokens']} tokens in {stats['elapsed']:.2f}s "
+                        f"({stats['tok_per_sec']:.2f} tok/s)[/dim]"
+                    )
             except Exception as e:
                 console.print(f"Error generating response: {e}", style="red")
                 console.print(traceback.format_exc(), style="red")
