@@ -40,6 +40,7 @@ class ModelConfig:
     d_linear_v: Optional[int] = None
     linear_conv_kernel: int = 4
     partial_rotary_factor: float = 1.0
+    mrope_section: Optional[List[int]] = None
 
 
 class KVCache:
@@ -100,12 +101,13 @@ class InferenceCache:
 class RotaryEmbedding(nn.Module):
     def __init__(self, config):
         super().__init__()
-        d = config.d_head
+        # Qwen3.5 uses partial rotary: only head_dim * partial_rotary_factor dims are rotated.
+        dim = int(config.d_head * config.partial_rotary_factor)
         t = config.rope_theta
-        r = torch.arange(0, d, 2)
-        self.register_buffer("inv_freq", 1.0 / (t ** (r / d)).float(), persistent=False)
+        r = torch.arange(0, dim, 2)
+        self.register_buffer("inv_freq", 1.0 / (t ** (r / dim)).float(), persistent=False)
 
-        self.mrope_section = [24, 20, 20]
+        self.mrope_section = config.mrope_section or [11, 11, 10]
 
     def forward(self, x, position_ids):
         inv_freq = self.inv_freq.to(dtype=torch.float32, device=x.device)
@@ -642,7 +644,7 @@ class Qwen3_5(nn.Module):
             )
 
         logits = (
-            output @ self.model.language_model.embed_tokens.weight.T
+            F.linear(output, self.model.language_model.embed_tokens.weight)
             if self.lm_head is None
             else self.lm_head(output)
         )
@@ -752,7 +754,9 @@ class Qwen3_5(nn.Module):
             d_linear_k=llm_config.get("linear_key_head_dim"),
             d_linear_v=llm_config.get("linear_value_head_dim"),
             linear_conv_kernel=llm_config.get("linear_conv_kernel_dim", 4),
-            partial_rotary_factor=llm_config.get("partial_rotary_factor", 1.0),
+            partial_rotary_factor=llm_config.get("rope_parameters", {}).get("partial_rotary_factor")
+                       or llm_config.get("partial_rotary_factor", 1.0),
+            mrope_section=llm_config.get("rope_parameters", {}).get("mrope_section"),
         )
 
         vision_config = None
