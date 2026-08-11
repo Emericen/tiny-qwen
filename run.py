@@ -8,11 +8,8 @@ import torch
 import traceback
 from contextlib import redirect_stderr
 
-import typer
 from huggingface_hub import snapshot_download
 from huggingface_hub.utils import disable_progress_bars
-import questionary
-from questionary import Choice, Style
 from rich.console import Console
 from rich.text import Text
 
@@ -61,20 +58,7 @@ ALL_MODELS = [
     "Qwen/Qwen3.5-35B-A3B",
 ]
 
-STYLE = Style(
-    [
-        ("question", "bold"),
-        ("selected", "fg:#000000 bg:#face0a bold"),
-        ("highlighted", "fg:#face0a bold"),
-        ("instruction", "fg:#888888"),
-        ("separator", "fg:#666666"),
-        ("text", ""),
-        ("qmark", "fg:#face0a"),
-    ]
-)
-
 console = Console(highlight=False)
-app = typer.Typer(add_completion=False)
 logging.getLogger("transformers").setLevel(logging.ERROR)
 logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 warnings.filterwarnings(
@@ -168,7 +152,6 @@ def generate_local_response(messages, model, processor, max_tokens=2048):
     yield {"stats": {"tokens": num_tokens, "elapsed": elapsed, "tok_per_sec": tokens_per_sec}}
 
 
-@app.command()
 def main():
     try:
         # clear terminal
@@ -180,16 +163,12 @@ def main():
         console.print(STARTING_HELP_TEXT)
 
         # select model variant
-        selected_model_variant = questionary.select(
-            message="Select model variant",
-            choices=[Choice(variant, variant) for variant in ALL_MODELS],
-            pointer=">",
-            qmark="",
-            style=STYLE,
-        ).ask()
-
-        if not selected_model_variant:
+        for i, variant in enumerate(ALL_MODELS, 1):
+            console.print(f"  [#face0a]{i}[/] {variant}")
+        choice = console.input("\n[bold]Select model variant [1]: [/]").strip() or "1"
+        if not choice.isdigit() or not 1 <= int(choice) <= len(ALL_MODELS):
             return
+        selected_model_variant = ALL_MODELS[int(choice) - 1]
 
         # load model
         hf_repo_id = selected_model_variant
@@ -224,7 +203,7 @@ def main():
             }
         ]
         while True:
-            user_input = questionary.text("USER: ", qmark="").ask()
+            user_input = console.input("[bold]USER: [/]")
 
             if user_input is None:
                 console.print("Goodbye!")
@@ -281,4 +260,4 @@ def main():
 
 
 if __name__ == "__main__":
-    app()
+    main()

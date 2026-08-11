@@ -1,5 +1,5 @@
 import torch
-import requests
+import urllib.request
 import numpy as np
 import json
 from pathlib import Path
@@ -172,9 +172,8 @@ class Processor:
     def _fetch_img_through_url(self, url: str) -> Image.Image:
         # Accepts both local file path and remote URL
         if url.startswith(("http://", "https://")):
-            response = requests.get(url)
-            response.raise_for_status()
-            return Image.open(BytesIO(response.content))
+            with urllib.request.urlopen(url) as response:
+                return Image.open(BytesIO(response.read()))
         else:
             return Image.open(url)
 
