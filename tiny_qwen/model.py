@@ -456,7 +456,7 @@ class Block(nn.Module):
         return x
 
 
-class Qwen3_5(nn.Module):
+class Model(nn.Module):
     def __init__(
         self, config: ModelConfig, vision_config: Optional[VisionConfig] = None
     ):

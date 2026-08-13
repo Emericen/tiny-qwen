@@ -159,7 +159,7 @@ def convert(src_dir, bits):
     import torch
     from safetensors import safe_open
     from safetensors.torch import save_file
-    from model.model import Qwen3_5, quantize_int8, quantize_int4, GROUP
+    from tiny_qwen.model import Model, quantize_int8, quantize_int4, GROUP
 
     src_dir = Path(src_dir)
     out = src_dir.parent / f"{src_dir.name}-int{bits}"
@@ -185,7 +185,7 @@ def convert(src_dir, bits):
     for path in sorted(src_dir.glob("*.safetensors")):
         with safe_open(path, framework="pt") as f:
             for key in f.keys():
-                name = Qwen3_5._rename(key)
+                name = Model._rename(key)
                 if name is None:
                     continue
                 tensor = f.get_tensor(key)
@@ -246,13 +246,13 @@ class LocalModel:
     Tool calls are parsed from the generated text (Qwen's native format)."""
 
     def __init__(self, weights_path):
-        from model.model import Qwen3_5
-        from model.processor import Processor
+        from tiny_qwen import Model
+        from tiny_qwen import Processor
 
         with console.status(Text(f"Loading {weights_path} …", style="dim"),
                             spinner="dots", spinner_style="#face0a"):
             self.processor = Processor.from_pretrained(weights_path)
-            self.model = Qwen3_5.from_pretrained(weights_path)
+            self.model = Model.from_pretrained(weights_path)
         self.device = next(self.model.parameters()).device
         self.messages = [
             {"role": "system", "content": [{"type": "text", "text": LOCAL_SYSTEM}]}

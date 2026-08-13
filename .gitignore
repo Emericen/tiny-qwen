@@ -17,3 +17,5 @@ textbook/
 tokenizers/
 runs/
 weights/
+*.log
+.experiments/
