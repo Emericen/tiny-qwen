@@ -1,10 +1,6 @@
-# runtime — everything run.py, agent.py, and quantize.py need
 torch
-torchvision
 numpy
 safetensors==0.5.3
 tokenizers>=0.22,<0.24
-huggingface_hub>=1.3,<2.0
-accelerate==1.6.0
 pillow==11.2.1
 rich==14.0.0

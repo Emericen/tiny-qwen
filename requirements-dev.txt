@@ -1,7 +1,0 @@
-# training, benchmarking, and parity testing against the reference stack
--r requirements.txt
-transformers @ git+https://github.com/huggingface/transformers.git
-lightning==2.5.3
-wandb==0.21.1
-matplotlib==3.10.3
-pytest
