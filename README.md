@@ -22,16 +22,16 @@ pip install uv
 uv venv && source .venv/bin/activate
 uv pip install -r requirements.txt
 
-# Launch the harness with Qwen 3.8 27B
+# Launch the harness (small default model, downloads on first run)
 python run.py
 ```
 
 Or pick any other model or quantization with launch parameters:
 
 ```bash
-python run.py Qwen/Qwen3.5-4B            # any HF repo id — fetched on demand
-python run.py Qwen/Qwen3.5-27B --bits 4  # download, quantize to int4, then run
-python run.py weights/Qwen3.5-27B-int4   # any local dir, e.g. a quantized one
+python run.py Qwen/Qwen3.8-27B           # any HF repo id — fetched on demand
+python run.py Qwen/Qwen3.8-27B --bits 4  # download, quantize to int4, then run
+python run.py weights/Qwen3.8-27B-int4   # any local dir, e.g. a quantized one
 ```
 
 Or bypass the local model entirely and point the same agentic harness at any OpenAI-compatible endpoint:

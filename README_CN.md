@@ -22,16 +22,16 @@ pip install uv
 uv venv && source .venv/bin/activate
 uv pip install -r requirements.txt
 
-# 用 Qwen 3.8 27B 启动智能体
+# 启动智能体（默认小模型，首次运行自动下载）
 python run.py
 ```
 
 也可以通过启动参数选择其他模型或量化：
 
 ```bash
-python run.py Qwen/Qwen3.5-4B            # 任意 HF repo id，按需下载
-python run.py Qwen/Qwen3.5-27B --bits 4  # 下载后量化为 int4 再运行
-python run.py weights/Qwen3.5-27B-int4   # 任意本地目录，例如量化后的
+python run.py Qwen/Qwen3.8-27B           # 任意 HF repo id，按需下载
+python run.py Qwen/Qwen3.8-27B --bits 4  # 下载后量化为 int4 再运行
+python run.py weights/Qwen3.8-27B-int4   # 任意本地目录，例如量化后的
 ```
 
 或完全绕过本地模型，把同一个智能体接到任何 OpenAI 兼容接口上：

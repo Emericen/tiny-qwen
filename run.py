@@ -1,9 +1,9 @@
 """A tiny agent. One tool: the terminal.
 
-    python run.py                           # local model (downloads on first run)
-    python run.py weights/Qwen3.5-0.8B-int4 # any local dir, e.g. quantized
-    python run.py Qwen/Qwen3.5-9B           # any HF repo id, fetched on demand
-    python run.py Qwen/Qwen3.5-27B --bits 4 # quantize after download, then run
+    python run.py                           # small default model, downloads on first run
+    python run.py Qwen/Qwen3.8-27B          # any HF repo id, fetched on demand
+    python run.py Qwen/Qwen3.8-27B --bits 4 # quantize after download, then run
+    python run.py weights/Qwen3.8-27B-int4  # any local dir, e.g. quantized
     python run.py --url https://api.fireworks.ai/inference/v1/chat/completions \
                     --api-key ... --model accounts/fireworks/models/kimi-k3
 
@@ -50,7 +50,7 @@ STARTING_HELP_TEXT = """\
 • /verbose to toggle thoughts and full command output
 """
 
-DEFAULT_MODEL = "Qwen/Qwen3.5-0.8B"  # flip to the 3.8 flagship on release
+DEFAULT_MODEL = "Qwen/Qwen3.5-0.8B"  # small, so first run succeeds on any machine
 WEIGHTS_DIR = Path("weights")
 HUB = "https://huggingface.co"
 
