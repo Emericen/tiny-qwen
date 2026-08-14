@@ -10,6 +10,8 @@
 
 一个用 PyTorch 极简复刻的 Qwen 3.8，自带单文件、无所不能的终端智能体（agentic harness），并支持 int4 量化。
 
+如果你觉得 Hugging Face 的代码难读，那你来对地方了。
+
 欢迎加入我的 [Discord 频道](https://discord.gg/sBNnqP9gaY)交流！
 
 ## 🎇 快速开始

@@ -10,6 +10,8 @@
 
 A minimal re-implementation of Qwen 3.8 with PyTorch. Comes with a single-file, all-purpose agentic harness and int4 quantization support.
 
+If you find Hugging Face code hard to read, you're in the right place.
+
 Join my [Discord channel](https://discord.gg/sBNnqP9gaY) for more discussion!
 
 ## 🎇 Quick Start
