@@ -20,6 +20,7 @@ import argparse
 import json
 import os
 import re
+import readline  # noqa: F401 — gives the input prompt arrows and history
 import select
 import subprocess
 import sys
@@ -544,9 +545,14 @@ class Agent:
             else:
                 self.transcript.action(command)
                 seen = VIEW_RE.match(command)
-                if seen and os.path.exists(seen.group(1)):
-                    self.backend.add_image_result(call_id, seen.group(1))
-                    self.transcript.output("(image shown to the model)")
+                if seen:
+                    path = os.path.expanduser(seen.group(1))
+                    if os.path.exists(path):
+                        self.backend.add_image_result(call_id, path)
+                        self.transcript.output("(image shown to the model)")
+                    else:
+                        self.backend.add_tool_result(call_id, f"(no such image: {path})")
+                        self.transcript.output(f"(no such image: {path})")
                     continue
                 output = self.terminal.run(command, esc)
             if output is None:
