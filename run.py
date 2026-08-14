@@ -65,7 +65,8 @@ INTERRUPT_NOTE = (
 
 SYSTEM = """You are a capable agent working from a terminal. The terminal is your only
 tool — files, code, searches, everything happens through shell commands. Keep commands
-short and non-interactive. When the task is done, answer in plain text with no markdown please. The user is talking to you via a terminal and markdowns will not render. Also, be concise."""
+short and non-interactive. One extra built-in exists: `view <path/to/image>` shows you
+an image file so you can actually see it. When the task is done, answer in plain text with no markdown please. The user is talking to you via a terminal and markdowns will not render. Also, be concise."""
 
 # The exact tool-section wording Qwen models are trained on — small models
 # only emit well-formed <tool_call> blocks when the prompt matches training.
@@ -100,6 +101,7 @@ TOOL = {
 
 TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.S)
 IMAGE_RE = re.compile(r"@([^\s]+\.(?:jpg|jpeg|png|gif|webp))", re.I)
+VIEW_RE = re.compile(r"^\s*view\s+(\S+\.(?:jpg|jpeg|png|gif|webp))\s*$", re.I)
 
 console = Console(highlight=False)
 verbose = False
@@ -314,6 +316,14 @@ class LocalModel:
             {"role": "tool", "content": [{"type": "text", "text": output}]}
         )
 
+    def add_image_result(self, call_id, path):
+        self.messages.append(
+            {"role": "tool", "content": [
+                {"type": "text", "text": "here is the image:"},
+                {"type": "image", "image": path},
+            ]}
+        )
+
 
 class RemoteModel:
     """Any OpenAI-compatible /chat/completions endpoint, via stdlib HTTP,
@@ -402,6 +412,16 @@ class RemoteModel:
 
     def add_tool_result(self, call_id, output):
         self.messages.append({"role": "tool", "tool_call_id": call_id, "content": output})
+
+    def add_image_result(self, call_id, path):
+        import base64
+        mime = "image/png" if path.lower().endswith(".png") else "image/jpeg"
+        data = base64.b64encode(open(path, "rb").read()).decode()
+        self.messages.append({"role": "tool", "tool_call_id": call_id,
+                              "content": "(the image follows in the next message)"})
+        self.messages.append({"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{data}"}}
+        ]})
 
 
 # ---------------------------------------------------------------- the loop
@@ -523,6 +543,11 @@ class Agent:
                 output = None
             else:
                 self.transcript.action(command)
+                seen = VIEW_RE.match(command)
+                if seen and os.path.exists(seen.group(1)):
+                    self.backend.add_image_result(call_id, seen.group(1))
+                    self.transcript.output("(image shown to the model)")
+                    continue
                 output = self.terminal.run(command, esc)
             if output is None:
                 interrupted = True
