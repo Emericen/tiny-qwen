@@ -256,7 +256,8 @@ class Processor:
            each 2x2 neighborhood are adjacent — the vision encoder later
            merges every consecutive 4 patches into one token
         """
-        # 1. resize
+        # 1. resize (convert first: palettized/RGBA images become plain RGB)
+        image = image.convert("RGB")
         height, width = np.array(image).shape[:2]
         resized_height, resized_width = self._resize_image(height, width, num_frames=1)
         frame = np.array(
