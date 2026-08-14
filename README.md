@@ -3,110 +3,68 @@
 </p>
 
 <p align="center">
-    <img src="assets/banner.png" alt="Tiny Qwen Interactive Chat" width="90%">
+    <img src="assets/banner.png" alt="Tiny Qwen" width="90%">
 </p>
 
 ## ✨ Tiny Qwen
 
-A minimal, easy-to-read PyTorch re-implementation of `Qwen3.5` vision-language models. Supports text+vision as well as dense and mixture-of-experts variants.
-
-For `Qwen3-VL` implementation, see [this branch](https://github.com/Emericen/tiny-qwen/tree/legacy/qwen3_vl).
-
-For `Qwen3` (text-only) and `Qwen2.5 VL` support, see [this branch](https://github.com/Emericen/tiny-qwen/tree/legacy/qwen2_5).
-
-For `DeepSeek R1`, see [this repo](https://github.com/Emericen/tiny-deepseek-r1).
+A minimal re-implementation of Qwen 3.8 with PyTorch. Comes with a single-file, all-purpose agentic harness and int4 quantization support.
 
 Join my [Discord channel](https://discord.gg/sBNnqP9gaY) for more discussion!
 
 ## 🎇 Quick Start
 
-Create a virtual environment:
-
 ```bash
-pip install uv 
-uv venv
-source .venv/bin/activate
+# Install dependencies
+pip install uv
+uv venv && source .venv/bin/activate
 uv pip install -r requirements.txt
-```
 
-Launch the interactive chat:
-
-```bash
+# Launch the harness with Qwen 3.8 27B
 python run.py
 ```
 
-**Note:** Use `@relative/path/to/image.jpg` to reference images.
-
-## 🧪 Ultimate Side-by-Side Test
-
-Run one script that iterates model variants and prints:
-1. Hugging Face Transformers output
-2. Tiny-Qwen output
-
-for the same image + prompt context, back-to-back per model.
+Or pick any other model or quantization with launch parameters:
 
 ```bash
-python test/run_ultimate_compare.py
+python run.py Qwen/Qwen3.5-4B            # any HF repo id — fetched on demand
+python run.py Qwen/Qwen3.5-27B --bits 4  # download, quantize to int4, then run
+python run.py weights/Qwen3.5-27B-int4   # any local dir, e.g. a quantized one
 ```
 
-By default it runs:
-
-- `Qwen/Qwen3.5-0.8B`
-- `Qwen/Qwen3.5-2B`
-- `Qwen/Qwen3.5-4B`
-- `Qwen/Qwen3.5-9B`
-- `Qwen/Qwen3.5-27B`
-- `Qwen/Qwen3.5-35B-A3B`
-
-Useful flags:
+Or bypass the local model entirely and point the same agentic harness at any OpenAI-compatible endpoint:
 
 ```bash
-# subset of models
-python test/run_ultimate_compare.py --models Qwen/Qwen3.5-2B Qwen/Qwen3.5-9B
-
-# custom image/prompt/tokens
-python test/run_ultimate_compare.py \
-  --image-path test/data/test-img-1.jpg \
-  --prompt "Describe this image accurately in 2-3 sentences." \
-  --max-new-tokens 128 \
-  --no-enable-thinking
+python run.py --url https://api.fireworks.ai/inference/v1/chat/completions \
+              --api-key $YOUR_KEY --model accounts/fireworks/models/kimi-k3
 ```
 
-## 📝 Code Examples
-
-Using the `Qwen3_5` class in code:
+## 📚 Use it as a library
 
 ```python
-from PIL import Image
-from huggingface_hub import snapshot_download
-from model.model import Qwen3_5
-from model.processor import Processor
+from tiny_qwen import Model, Processor
 
-image = Image.open("test/data/test-img-1.jpg")
+model = Model.from_pretrained("weights/Qwen3.5-4B")
+processor = Processor.from_pretrained("weights/Qwen3.5-4B")
 
 messages = [
-    {
-        "role": "user",
-        "content": [
-            {"type": "image", "image": image},
-            {"type": "text", "text": "What's on this image?"},
-        ],
-    },
+    {"role": "user", "content": [
+        {"type": "text", "text": "Describe this image in one sentence."},
+        {"type": "image", "image": "photos/cat.jpg"},
+    ]},
 ]
+inputs = processor(messages, add_generation_prompt=True, device="mps")
 
-model_name = "Qwen/Qwen3.5-27B"
-weights = snapshot_download(repo_id=model_name, cache_dir=".cache")
-model = Qwen3_5.from_pretrained(weights_path=weights, device_map="auto")
-processor = Processor.from_pretrained(model_name)
-
-device = next(model.parameters()).device
-inputs = processor(messages, add_generation_prompt=True, device=device)
-
-output_ids = model.generate(**inputs, max_new_tokens=64)
-print(processor.tokenizer.decode(output_ids[0].tolist()))
-
-print("Streaming output:", end=" ", flush=True)
-for token_id in model.generate_stream(**inputs, max_new_tokens=64):
+for token_id in model.generate_stream(
+    **inputs, max_new_tokens=256, stop_tokens=processor.stop_tokens
+):
     print(processor.tokenizer.decode([token_id]), end="", flush=True)
-print()
 ```
+
+## Older versions
+
+`main` runs the whole Qwen 3.5 / 3.6 / 3.8 architecture generation. Older architectures live in branches: [Qwen 3 VL](https://github.com/Emericen/tiny-qwen/tree/legacy/qwen3_vl), [Qwen 3 & Qwen 2.5 VL](https://github.com/Emericen/tiny-qwen/tree/legacy/qwen2_5).
+
+## License
+
+MIT
