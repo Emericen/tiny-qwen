@@ -1,5 +1,5 @@
 import torch
-import requests
+import urllib.request
 import numpy as np
 import json
 from pathlib import Path
@@ -7,7 +7,6 @@ from PIL import Image
 from io import BytesIO
 from typing import List, Tuple, Optional
 from tokenizers import Tokenizer
-from huggingface_hub import hf_hub_download
 
 # fmt: off
 # Constants for message rendering
@@ -35,31 +34,40 @@ class Processor:
         tokenizer: Tokenizer,
         min_pixels: int = 65536,
         max_pixels: int = 16777216,
+        image_token_id: Optional[int] = None,
     ):
         self.tokenizer = tokenizer
         self.min_pixels = min_pixels
         self.max_pixels = max_pixels
+        self.image_token_id = image_token_id
 
     @classmethod
-    def from_pretrained(cls, repo_id: str):
-        tokenizer = Tokenizer.from_pretrained(repo_id)
+    def from_pretrained(cls, weights_path):
+        """Load from a local checkpoint directory (tokenizer.json + configs)."""
+        path = Path(weights_path)
+        tokenizer = Tokenizer.from_file(str(path / "tokenizer.json"))
 
-        # Load preprocessor config to get size parameters
-        try:
-            config_path = hf_hub_download(repo_id, "preprocessor_config.json")
-            with open(config_path, "r") as f:
-                config = json.load(f)
+        min_pixels, max_pixels = 65536, 16777216
+        preprocessor = path / "preprocessor_config.json"
+        if preprocessor.exists():
+            size = json.loads(preprocessor.read_text()).get("size", {})
+            min_pixels = size.get("shortest_edge", min_pixels)
+            max_pixels = size.get("longest_edge", max_pixels)
 
-            # Extract size parameters
-            size = config.get("size", {})
-            min_pixels = size.get("shortest_edge", 65536)
-            max_pixels = size.get("longest_edge", 16777216)
-        except Exception:
-            # Fallback to defaults if config not found
-            min_pixels = 65536
-            max_pixels = 16777216
+        image_token_id = None
+        config = path / "config.json"
+        if config.exists():
+            image_token_id = json.loads(config.read_text()).get("image_token_id")
 
-        return cls(tokenizer, min_pixels=min_pixels, max_pixels=max_pixels)
+        return cls(tokenizer, min_pixels=min_pixels, max_pixels=max_pixels,
+                   image_token_id=image_token_id)
+
+    @property
+    def stop_tokens(self):
+        """Token ids that end a generation turn, resolved from the tokenizer."""
+        names = ("<|im_end|>", "<|im_start|>", "<|endoftext|>")
+        ids = (self.tokenizer.token_to_id(n) for n in names)
+        return [i for i in ids if i is not None]
 
     # Turn openai harmony style messages into model input tensors.
     def __call__(
@@ -124,14 +132,74 @@ class Processor:
             "input_ids": input_ids,
             "pixels": pixels,
             "d_image": d_image,
+            "position_ids": self.get_position_ids(input_ids, d_image),
         }
         if device is not None:
-            output["input_ids"] = output["input_ids"].to(device)
-            if output["pixels"] is not None:
-                output["pixels"] = output["pixels"].to(device)
-            if output["d_image"] is not None:
-                output["d_image"] = output["d_image"].to(device)
+            for key, value in output.items():
+                if value is not None:
+                    output[key] = value.to(device)
         return output
+
+    # mRoPE position ids. Text tokens advance all three sections together;
+    # each image/video block advances (time, height, width) independently so
+    # a patch's position encodes where it sits in the frame.
+    def get_position_ids(
+        self, input_ids: torch.Tensor, d_image: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        B, T = input_ids.shape
+
+        # text-only: sequential position ids repeated over the 3 sections
+        if d_image is None:
+            position_ids = torch.arange(T, dtype=torch.long)
+            return position_ids.unsqueeze(0).expand(3, B, -1)
+
+        position_ids = torch.zeros(3, B, T, dtype=torch.long)
+        for batch_idx in range(B):
+            seq = input_ids[batch_idx]
+            text_idx, image_idx, seq_idx = 0, 0, 0
+            while seq_idx < T:
+                if seq[seq_idx].item() == self.image_token_id:
+                    text_idx, image_idx, seq_idx = self._emit_image_block(
+                        position_ids=position_ids,
+                        batch_idx=batch_idx,
+                        seq_idx=seq_idx,
+                        text_idx=text_idx,
+                        image_idx=image_idx,
+                        d_image=d_image,
+                    )
+                else:
+                    position_ids[:, batch_idx, seq_idx] = text_idx
+                    text_idx, seq_idx = text_idx + 1, seq_idx + 1
+
+        return position_ids
+
+    def _emit_image_block(
+        self,
+        position_ids: torch.Tensor,
+        batch_idx: int,
+        seq_idx: int,
+        text_idx: int,
+        image_idx: int,
+        d_image: torch.Tensor,
+    ) -> Tuple[int, int, int]:
+        t_img, h_img, w_img = d_image[image_idx]
+        t_img = int(t_img.item())
+        h_img = int((h_img // SPATIAL_MERGE_SIZE).item())
+        w_img = int((w_img // SPATIAL_MERGE_SIZE).item())
+
+        image_token_count = h_img * w_img
+        video_token_count = t_img * image_token_count
+        for offset in range(video_token_count):
+            target_idx = seq_idx + offset
+            remaining = offset % image_token_count
+            h_pos = remaining // w_img
+            w_pos = remaining % w_img
+
+            position_ids[:, batch_idx, target_idx] = text_idx
+            position_ids[1, batch_idx, target_idx] = text_idx + h_pos
+            position_ids[2, batch_idx, target_idx] = text_idx + w_pos
+
+        return text_idx + 1, image_idx + 1, seq_idx + video_token_count
 
     def _render_content(
         self, content: dict, pixels_list: list, d_image_list: list
@@ -172,40 +240,48 @@ class Processor:
     def _fetch_img_through_url(self, url: str) -> Image.Image:
         # Accepts both local file path and remote URL
         if url.startswith(("http://", "https://")):
-            response = requests.get(url)
-            response.raise_for_status()
-            return Image.open(BytesIO(response.content))
+            with urllib.request.urlopen(url) as response:
+                return Image.open(BytesIO(response.read()))
         else:
             return Image.open(url)
 
     def _process_image(self, image: Image.Image) -> Tuple[np.ndarray, int, int, int]:
-        image_np = np.array(image, dtype=np.float32)
-        height, width = image_np.shape[:2]
+        """Image -> a sequence of patch vectors (Qwen2-VL dynamic resolution).
+
+        1. resize so height and width divide patch*merge (16*2 = 32) pixels
+        2. normalize to zero mean, unit-ish scale
+        3. duplicate the still image into 2 identical frames, so images and
+           2-frame videos share one code path
+        4. cut into 16x16-pixel patches and order them so the 4 patches of
+           each 2x2 neighborhood are adjacent — the vision encoder later
+           merges every consecutive 4 patches into one token
+        """
+        # 1. resize (convert first: palettized/RGBA images become plain RGB)
+        image = image.convert("RGB")
+        height, width = np.array(image).shape[:2]
         resized_height, resized_width = self._resize_image(height, width, num_frames=1)
-        image_resized = image.resize(
-            (resized_width, resized_height), resample=Image.BICUBIC
+        frame = np.array(
+            image.resize((resized_width, resized_height), resample=Image.BICUBIC),
+            dtype=np.float32,
         )
-        image_np_resized = np.array(image_resized, dtype=np.float32)
 
-        # Normalize
-        image_np_resized = image_np_resized / 255.0
-        image_np_resized = (image_np_resized - IMAGE_MEAN) / IMAGE_STD
+        # 2. normalize
+        frame = (frame / 255.0 - IMAGE_MEAN) / IMAGE_STD
 
-        # Convert to channels-first and add batch dimension
-        image_np_resized = np.transpose(image_np_resized, (2, 0, 1))
-        image_np_resized = image_np_resized[np.newaxis, ...]
+        # 3. channels-first, then duplicate to TEMPORAL_PATCH_SIZE frames
+        frames = np.tile(
+            np.transpose(frame, (2, 0, 1))[np.newaxis], (TEMPORAL_PATCH_SIZE, 1, 1, 1)
+        )
 
-        # Handle temporal dimension
-        if image_np_resized.shape[0] == 1:
-            image_np_resized = np.tile(image_np_resized, (TEMPORAL_PATCH_SIZE, 1, 1, 1))
-
-        # Extract patches
-        batch_size, channels, height, width = image_np_resized.shape
-        grid_t = batch_size // TEMPORAL_PATCH_SIZE
+        # 4. patchify. Axis legend for the reshape:
+        #    (t, frame, C, h_block, h_in_block, px_row, w_block, w_in_block, px_col)
+        #    where a "block" is a 2x2 group of patches and px are the 16x16
+        #    pixels inside one patch.
+        n_frames, channels = frames.shape[:2]
+        grid_t = n_frames // TEMPORAL_PATCH_SIZE
         grid_h = resized_height // SPATIAL_PATCH_SIZE
         grid_w = resized_width // SPATIAL_PATCH_SIZE
-
-        patches = image_np_resized.reshape(
+        patches = frames.reshape(
             grid_t,
             TEMPORAL_PATCH_SIZE,
             channels,
@@ -216,14 +292,16 @@ class Processor:
             SPATIAL_MERGE_SIZE,
             SPATIAL_PATCH_SIZE,
         )
-
+        #    reorder to (t, h_block, w_block, h_in_block, w_in_block, C, frame, px_row, px_col):
+        #    sequence = raster over 2x2 blocks, then the 4 patches within each;
+        #    feature  = channel * 2 frames * 16 * 16 pixels, flattened
         patches = patches.transpose(0, 3, 6, 4, 7, 2, 1, 5, 8)
-        flatten_patches = patches.reshape(
+        patches = patches.reshape(
             grid_t * grid_h * grid_w,
             channels * TEMPORAL_PATCH_SIZE * SPATIAL_PATCH_SIZE * SPATIAL_PATCH_SIZE,
         )
 
-        return flatten_patches.astype(np.float32), grid_t, grid_h, grid_w
+        return patches.astype(np.float32), grid_t, grid_h, grid_w
 
     def _resize_image(
         self, height: int, width: int, num_frames: int = 1

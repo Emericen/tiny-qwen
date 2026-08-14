@@ -16,3 +16,6 @@ textbook/
 .claude/
 tokenizers/
 runs/
+weights/
+*.log
+.experiments/

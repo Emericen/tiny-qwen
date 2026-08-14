@@ -3,75 +3,70 @@
 </p>
 
 <p align="center">
-    <img src="test/data/banner.png" alt="Tiny Qwen 交互式对话" width="90%">
+    <img src="assets/banner.gif" alt="Tiny Qwen" width="90%">
 </p>
 
-# ✨ Tiny Qwen
+## ✨ Tiny Qwen
 
-一个简洁易读的 PyTorch 代码库，用于重写 `Qwen3.5` 视觉语言模型，同时支持文本与视觉模态，并兼容稠密和混合专家架构。
+一个用 PyTorch 极简复刻的 Qwen 3.8，自带单文件、无所不能的终端智能体（agentic harness），并支持 int4 量化。
 
-如果你觉得 Hugging Face 的代码难读，那你来对地方了
+如果你觉得 Hugging Face 的代码难读，那你来对地方了。
 
-若需 `Qwen3`（纯文本）与 `Qwen2.5 VL` 支持，请查看[这个 branch](https://github.com/Emericen/tiny-qwen/tree/legacy/qwen2_5)。
-
-若需 `DeepSeek R1`，请查看[这个仓库](https://github.com/Emericen/tiny-deepseek-r1)。
-
-欢迎大家加我的 [Discord ](https://discord.gg/sBNnqP9gaY)继续讨论！
+欢迎加入我的 [Discord 频道](https://discord.gg/sBNnqP9gaY)交流！
 
 ## 🎇 快速开始
 
-推荐使用 `uv` 创建并隔离虚拟环境：
-
 ```bash
-pip install uv 
-uv venv
-source .venv/bin/activate
+# 安装依赖
+pip install uv
+uv venv && source .venv/bin/activate
 uv pip install -r requirements.txt
-```
 
-启动CLI：
-
-```bash
+# 启动智能体（默认小模型，首次运行自动下载）
 python run.py
 ```
 
-**注意：** 引用图片要用 `@relative/path/to/image.jpg`。
+也可以通过启动参数选择其他模型或量化：
 
-## 📝 代码示例
+```bash
+python run.py Qwen/Qwen3.8-27B           # 任意 HF repo id，按需下载
+python run.py Qwen/Qwen3.8-27B --bits 4  # 下载后量化为 int4 再运行
+python run.py weights/Qwen3.8-27B-int4   # 任意本地目录，例如量化后的
+```
 
-使用 `Qwen3_5` 类：
+或完全绕过本地模型，把同一个智能体接到任何 OpenAI 兼容接口上：
+
+```bash
+python run.py --url https://api.fireworks.ai/inference/v1/chat/completions \
+              --api-key $YOUR_KEY --model accounts/fireworks/models/kimi-k3
+```
+
+## 📚 作为库使用
 
 ```python
-from PIL import Image
-from huggingface_hub import snapshot_download
-from model.model import Qwen3_5
-from model.processor import Processor
+from tiny_qwen import Model, Processor
 
-image = Image.open("test/data/test-img-1.jpg")
+model = Model.from_pretrained("weights/Qwen3.5-4B")
+processor = Processor.from_pretrained("weights/Qwen3.5-4B")
 
 messages = [
-    {
-        "role": "user",
-        "content": [
-            {"type": "image", "image": image},
-            {"type": "text", "text": "这张图片里有什么？"},
-        ],
-    },
+    {"role": "user", "content": [
+        {"type": "text", "text": "用一句话描述这张图片。"},
+        {"type": "image", "image": "photos/cat.jpg"},
+    ]},
 ]
+inputs = processor(messages, add_generation_prompt=True, device="mps")
 
-model_name = "Qwen/Qwen3.5-27B"
-weights = snapshot_download(repo_id=model_name, cache_dir=".cache")
-model = Qwen3_5.from_pretrained(weights_path=weights, device_map="auto")
-processor = Processor.from_pretrained(model_name)
-
-device = next(model.parameters()).device
-inputs = processor(messages, add_generation_prompt=True, device=device)
-
-output_ids = model.generate(**inputs, max_new_tokens=64)
-print(processor.tokenizer.decode(output_ids[0].tolist()))
-
-print("流式输出:", end=" ", flush=True)
-for token_id in model.generate_stream(**inputs, max_new_tokens=64):
+for token_id in model.generate_stream(
+    **inputs, max_new_tokens=256, stop_tokens=processor.stop_tokens
+):
     print(processor.tokenizer.decode([token_id]), end="", flush=True)
-print()
 ```
+
+## 旧版本
+
+`main` 分支支持整个 Qwen 3.5 / 3.6 / 3.8 架构世代。更早的架构在这些分支：[Qwen 3 VL](https://github.com/Emericen/tiny-qwen/tree/legacy/qwen3_vl)、[Qwen 3 与 Qwen 2.5 VL](https://github.com/Emericen/tiny-qwen/tree/legacy/qwen2_5)。
+
+## 许可证
+
+MIT
