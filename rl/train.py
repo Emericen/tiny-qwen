@@ -19,7 +19,13 @@ import argparse
 import torch
 
 from rl.dealer import BB, Dealer, FishSeat, default_action, parse_reply
-from rl.play import SYSTEM
+
+SYSTEM = (
+    "You are playing heads-up no-limit Texas hold'em for chips. "
+    "Play the hand by calling the `act` tool with one legal action copied exactly from the list. "
+    "Keep calling `act` after each new game state until the hand is over. "
+    "Never answer in plain text; every decision must be an `act` call."
+)
 
 
 class PokerEnv:
@@ -94,6 +100,50 @@ class PokerEnv:
             legal = self.dealer.legal_actions(1)
             action, say = self.fish.act(obs, legal)
             self.dealer.step(action, say)
+
+
+def processing_class_that_parses_tool_calls(model_path):
+    """Qwen3.5 emits XML tool calls (<function=act><parameter=action>...). TRL parses them with
+    transformers' parse_response, driven by a response template (new style) or a response
+    schema (legacy). Some transformers builds accept the template yet return no tool_calls,
+    silently — every hand would then resolve as a passive fold and the run would train on
+    nothing. So we exercise the exact path the trainer uses and fall back to the legacy schema.
+
+    Qwen3.5 checkpoints are vision-language models; we hand TRL the processor (not just the
+    tokenizer) so it reads the text config correctly, even though every prompt here is text."""
+    import os
+
+    from transformers import AutoProcessor, AutoTokenizer
+    from trl.chat_template_utils import add_response_schema, parse_response, qwen3_5_schema
+
+    if os.path.exists(os.path.join(model_path, "preprocessor_config.json")) or not os.path.isdir(model_path):
+        processing_class = AutoProcessor.from_pretrained(model_path)
+    else:
+        processing_class = AutoTokenizer.from_pretrained(model_path)
+    tokenizer = getattr(processing_class, "tokenizer", processing_class)
+    add_response_schema(tokenizer)
+    tools = [{"type": "function", "function": {"name": "act", "parameters": {"type": "object", "properties": {"action": {"type": "string"}}}}}]
+    prompt_ids = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "call the act tool"}], tools=tools, add_generation_prompt=True, tokenize=True
+    )
+    if hasattr(prompt_ids, "input_ids"):
+        prompt_ids = prompt_ids["input_ids"]
+    sample = "<think>\n\n</think>\n\n<tool_call>\n<function=act>\n<parameter=action>\ncall\n</parameter>\n</function>\n</tool_call>"
+    sample_ids = tokenizer(sample + tokenizer.eos_token, add_special_tokens=False)["input_ids"]
+
+    def parses():
+        try:
+            return bool(parse_response(tokenizer, sample_ids, prefix=prompt_ids).get("tool_calls"))
+        except Exception:
+            return False
+
+    if not parses():
+        tokenizer.response_template = None
+        tokenizer.response_schema = qwen3_5_schema
+        print("[poker] using legacy response_schema for tool-call parsing", flush=True)
+    if not parses():
+        raise RuntimeError("tokenizer cannot parse Qwen3.5 tool calls; training would never execute an action")
+    return processing_class
 
 
 def build_dataset(n_deals):
@@ -171,6 +221,7 @@ def main():
     trainer = GRPOTrainer(
         model=args.model,
         args=config,
+        processing_class=processing_class_that_parses_tool_calls(args.model),
         environment_factory=PokerEnv,
         train_dataset=build_dataset(args.deals),
         peft_config=peft_config,
