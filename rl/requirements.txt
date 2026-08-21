@@ -1,0 +1,8 @@
+# rl/ needs nothing beyond the repo's requirements.txt for the dealer and tests.
+# The trainer and the GPU baselines need these (install on the pod, see pod.sh):
+transformers>=5.13
+trl>=1.10
+peft>=0.18
+datasets>=4.0
+accelerate>=1.10
+vllm>=0.17
