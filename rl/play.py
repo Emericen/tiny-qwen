@@ -76,7 +76,7 @@ def vllm_generator(model_path, max_new_tokens=128, thinking=False, temperature=1
     return generate
 
 
-def openai_generator(url, model, api_key="", max_new_tokens=128, temperature=1.0):
+def openai_generator(url, model, api_key="", max_new_tokens=128, temperature=1.0, thinking=False):
     """Any OpenAI-compatible chat endpoint: a frontier model, a local server, or OpenMNK's /v1."""
 
     def generate(observation):
@@ -86,6 +86,8 @@ def openai_generator(url, model, api_key="", max_new_tokens=128, temperature=1.0
             "tools": [ACT_TOOL],
             "max_tokens": max_new_tokens,
             "temperature": temperature,
+            # vLLM honors this, keeping server evals on the same thinking setting as training.
+            "chat_template_kwargs": {"enable_thinking": thinking},
         }
         request = urllib.request.Request(
             url,
@@ -138,7 +140,7 @@ def main():
     elif args.backend == "vllm":
         generate = vllm_generator(args.model, args.max_new_tokens, args.thinking, args.temperature)
     else:
-        generate = openai_generator(args.url, args.model, args.api_key, args.max_new_tokens, args.temperature)
+        generate = openai_generator(args.url, args.model, args.api_key, args.max_new_tokens, args.temperature, args.thinking)
     generate = showing(generate, args.show)
 
     policy = ToolSeat(generate)

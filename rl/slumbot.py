@@ -199,7 +199,9 @@ def main():
     parser.add_argument("--policy", default="model", choices=["model", "fish"])
     parser.add_argument("--vs-style", default="station", help="fish style when --policy fish")
     parser.add_argument("--model", default="weights/Qwen3.5-0.8B")
-    parser.add_argument("--backend", default="hf", choices=["hf", "vllm"])
+    parser.add_argument("--backend", default="hf", choices=["hf", "vllm", "openai"])
+    parser.add_argument("--url", default="", help="openai backend: chat completions URL")
+    parser.add_argument("--api-key", default="")
     parser.add_argument("--thinking", action="store_true")
     parser.add_argument("--show", type=int, default=1)
     args = parser.parse_args()
@@ -207,10 +209,12 @@ def main():
     if args.policy == "fish":
         seat = FishSeat(args.vs_style, seed=0)
     else:
-        from rl.play import hf_generator, vllm_generator
+        from rl.play import hf_generator, openai_generator, vllm_generator
 
         if args.backend == "hf":
             generate = hf_generator(args.model, thinking=args.thinking)
+        elif args.backend == "openai":
+            generate = openai_generator(args.url, args.model, args.api_key, thinking=args.thinking)
         else:
             generate = vllm_generator(args.model, thinking=args.thinking)
         seat = ToolSeat(generate)
