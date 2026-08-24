@@ -94,9 +94,15 @@ def configure_tool_parsing(tokenizer):
     try:
         add_response_schema(tokenizer)
     except ValueError:
-        # TRL only byte-matches templates it knows; Qwen3.8 is newer but speaks the same XML.
-        tokenizer.response_template = None
-        tokenizer.response_schema = qwen3_5_schema
+        # TRL only recognizes templates it knows. Qwen3.8 emits byte-identical tool-call XML
+        # to Qwen3.5, so borrow the parsing config from a tokenizer TRL does recognize —
+        # this tracks whichever attribute the installed transformers wants.
+        from transformers import AutoTokenizer
+
+        donor = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-0.8B")
+        add_response_schema(donor)
+        tokenizer.response_template = getattr(donor, "response_template", None)
+        tokenizer.response_schema = getattr(donor, "response_schema", None)
     prompt_ids = tokenizer.apply_chat_template(
         [{"role": "user", "content": "call the act tool"}], tools=[ACT_TOOL], add_generation_prompt=True, tokenize=True
     )
