@@ -12,6 +12,7 @@ dance rl/train.py does for the trainer.
 """
 
 import json
+import re
 
 from rl.game.dealer import default_action, parse_reply
 
@@ -58,6 +59,23 @@ def tool_call_args(message):
         action = str(arguments.get("action") or "").strip()
         say = str(arguments.get("say") or "").strip()
         return (action or None), say
+    # Some models at temperature write the call as TEXT instead of a structured
+    # entry (Grok 4.6: bare {"name": "act", ...} JSON, sometimes <tool_call>-wrapped,
+    # "arguments" or "parameters"). The bench measures poker, not formatting, so
+    # decode those too — this path never fires for a well-formed response.
+    content = (message.get("content") or "").strip()
+    blob_match = re.search(r"\{.*\}", content, re.DOTALL)
+    if blob_match:
+        try:
+            blob = json.loads(blob_match.group(0))
+        except json.JSONDecodeError:
+            return None, ""
+        if isinstance(blob, dict) and blob.get("name") == "act":
+            arguments = blob.get("arguments") or blob.get("parameters") or {}
+            if isinstance(arguments, dict):
+                action = str(arguments.get("action") or "").strip()
+                say = str(arguments.get("say") or "").strip()
+                return (action or None), say
     return None, ""
 
 
@@ -83,6 +101,10 @@ class ToolSeat:
             chosen, _ = parse_reply(action, legal)
         if chosen is None:
             self.invalid += 1
+            # An invalid reply becomes a forced default action — that biases results, so
+            # every one must be visible in the log, not just a count at the end.
+            shown = {k: message.get(k) for k in ("content", "tool_calls") if message.get(k)}
+            print(f"[invalid reply #{self.invalid}] {json.dumps(shown, default=str)[:400]}", flush=True)
             chosen = default_action(legal)
         return chosen, say
 
