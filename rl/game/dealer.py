@@ -454,11 +454,15 @@ def play_hand(dealer, seats):
     return dealer.result()
 
 
-def play_match(make_a, make_b, hands=100, seed=0, mirrored=True, talk=False):
+def play_match(make_a, make_b, hands=100, seed=0, mirrored=True, talk=False, progress=None):
     """A vs B for `hands` hands. Returns A's bb/100 and both invalid rates.
 
     With `mirrored`, each seed is dealt twice with seats swapped, so card luck
     cancels exactly and only decisions remain. `hands` counts both copies.
+
+    `progress(played, hands, total_chips)` is called after every hand; returning
+    False stops the match early and the stats cover the hands actually played —
+    so a budget cap or a kill signal never erases the data already paid for.
     """
     total = 0.0
     played = 0
@@ -478,6 +482,8 @@ def play_match(make_a, make_b, hands=100, seed=0, mirrored=True, talk=False):
         deltas = play_hand(dealer, seats)
         total += deltas[a_seat]
         played += 1
+        if progress and progress(played, hands, total) is False:
+            break
     stats = {
         "hands": played,
         "bb_per_100": 100.0 * total / played / BB,

@@ -204,36 +204,46 @@ def main():
     parser.add_argument("--api-key", default="")
     parser.add_argument("--thinking", action="store_true")
     parser.add_argument("--max-new-tokens", type=int, default=768, help="tight caps silently truncate big-pot decisions into forced folds")
+    parser.add_argument("--terse", action="store_true", help="ask for the bare tool call — verbose API models bill every word of analysis")
+    parser.add_argument("--token-budget", type=int, default=0, help="stop cleanly (partial stats intact) once total in+out tokens exceed this; 0 = no cap")
     parser.add_argument("--show", type=int, default=1)
     args = parser.parse_args()
 
     if args.policy == "fish":
         seat = FishSeat(args.vs_style, seed=0)
     else:
-        from rl.play import hf_generator, openai_generator, vllm_generator
+        from rl.play import SYSTEM, TERSE, hf_generator, openai_generator, vllm_generator
 
+        system = SYSTEM + TERSE if args.terse else SYSTEM
         if args.backend == "hf":
             generate = hf_generator(args.model, max_new_tokens=args.max_new_tokens, thinking=args.thinking)
         elif args.backend == "openai":
-            generate = openai_generator(args.url, args.model, args.api_key, args.max_new_tokens, thinking=args.thinking)
+            generate = openai_generator(args.url, args.model, args.api_key, args.max_new_tokens, thinking=args.thinking, system=system)
         else:
             generate = vllm_generator(args.model, max_new_tokens=args.max_new_tokens, thinking=args.thinking)
         seat = ToolSeat(generate)
 
+    usage = getattr(getattr(seat, "generate", None), "usage", None)
     token = None
     total = 0
     baseline_total = 0
+    played = 0
     for i in range(args.hands):
         token, winnings, baseline = play_hand(seat, token, show=i < args.show)
         total += winnings
         baseline_total += baseline or 0
-        print(f"hand {i + 1}: {winnings / BB:+.1f} bb  running {total / BB:+.1f} bb")
-    print()
-    print(f"hands     {args.hands}")
-    print(f"bb/100    {100 * total / args.hands / BB:+.1f}")
-    print(f"baseline  {100 * baseline_total / args.hands / BB:+.1f}  (Slumbot's own variance-reduced number)")
+        played += 1
+        meter = f"  tokens {usage['in']}+{usage['out']}" if usage else ""
+        print(f"hand {played}: {winnings / BB:+.1f} bb  running {total / BB:+.1f} bb{meter}", flush=True)
+        if args.token_budget and usage and usage["in"] + usage["out"] > args.token_budget:
+            print(f"token budget {args.token_budget} exhausted — stopping with partial results", flush=True)
+            break
+    print(flush=True)
+    print(f"hands     {played}")
+    print(f"bb/100    {100 * total / max(1, played) / BB:+.1f}")
+    print(f"baseline  {100 * baseline_total / max(1, played) / BB:+.1f}  (Slumbot's own variance-reduced number)")
     if hasattr(seat, "decisions"):
-        print(f"invalid   {100 * seat.invalid / max(1, seat.decisions):.1f}% of {seat.decisions} decisions")
+        print(f"invalid   {100 * seat.invalid / max(1, seat.decisions):.1f}% of {seat.decisions} decisions", flush=True)
 
 
 if __name__ == "__main__":
