@@ -104,8 +104,10 @@ def openai_generator(url, model, api_key="", max_new_tokens=128, temperature=1.0
         with urllib.request.urlopen(request, timeout=60) as response:
             data = json.load(response)
         u = data.get("usage") or {}
-        usage["in"] += int(u.get("prompt_tokens") or 0)
-        usage["out"] += int(u.get("completion_tokens") or 0)
+        prompt_tokens = int(u.get("prompt_tokens") or 0)
+        usage["in"] += prompt_tokens
+        # Reasoning models bill hidden thinking outside completion_tokens; total_tokens has it.
+        usage["out"] += max(int(u.get("completion_tokens") or 0), int(u.get("total_tokens") or 0) - prompt_tokens)
         return data["choices"][0]["message"]
 
     generate.usage = usage
