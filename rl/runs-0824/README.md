@@ -39,5 +39,16 @@ Zero-shot 27B ≈ the unscaffolded-frontier line.
    measured $/hand from the provider's usage endpoint → size the run → one opponent
    at a time.
 
+4. **Grok-4.6 text-formatted tool calls (~40% on some workers).** At temperature 1.0
+   Grok often writes its call as plain content — bare `{"name": "act", ...}` JSON
+   ("arguments" OR "parameters"), sometimes `<tool_call>`-wrapped — and xAI does not
+   promote it to the structured field. Structured-only parsing counted those invalid
+   → forced folds (maniac worker read −332 at 41.6% invalid). Third appearance of the
+   same lesson: invalid-action handling dominates measured "skill". Fix: content
+   fallback decoder in `tool_call_args` (fires for no model that formats correctly),
+   plus every invalid reply is now printed to the log. First Grok ladder
+   (`grok46-*.log`) is superseded by the clean rerun (`grok46v2-*.log`).
+
 Day's spend: RunPod $12.76 (all infrastructure lessons + both ladders + ~40 min of
-27B training), OpenRouter $10.92 (incident 3).
+27B training), OpenRouter $10.92 (incident 3), xAI ~$8 (first Grok ladder, superseded
+by the rerun) + the clean rerun.
