@@ -121,7 +121,12 @@ def processing_class_that_parses_tool_calls(model_path):
     else:
         processing_class = AutoTokenizer.from_pretrained(model_path)
     tokenizer = getattr(processing_class, "tokenizer", processing_class)
-    add_response_schema(tokenizer)
+    try:
+        add_response_schema(tokenizer)
+    except ValueError:
+        # TRL only byte-matches templates it knows; Qwen3.8 is newer but speaks the same XML.
+        tokenizer.response_template = None
+        tokenizer.response_schema = qwen3_5_schema
     tools = [{"type": "function", "function": {"name": "act", "parameters": {"type": "object", "properties": {"action": {"type": "string"}}}}}]
     prompt_ids = tokenizer.apply_chat_template(
         [{"role": "user", "content": "call the act tool"}], tools=tools, add_generation_prompt=True, tokenize=True

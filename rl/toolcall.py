@@ -91,7 +91,12 @@ def configure_tool_parsing(tokenizer):
     """Make parse_message work for Qwen3.5's XML tool calls; see module docstring."""
     from trl.chat_template_utils import add_response_schema, parse_response, qwen3_5_schema
 
-    add_response_schema(tokenizer)
+    try:
+        add_response_schema(tokenizer)
+    except ValueError:
+        # TRL only byte-matches templates it knows; Qwen3.8 is newer but speaks the same XML.
+        tokenizer.response_template = None
+        tokenizer.response_schema = qwen3_5_schema
     prompt_ids = tokenizer.apply_chat_template(
         [{"role": "user", "content": "call the act tool"}], tools=[ACT_TOOL], add_generation_prompt=True, tokenize=True
     )
