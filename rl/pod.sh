@@ -21,7 +21,9 @@ OUT=${OUT:-runs/$(basename "$MODEL")-$VS}
 EXTRA=${EXTRA:-}
 mkdir -p "$(dirname "$OUT")"
 
-pip install -q -r requirements.txt -r rl/requirements.txt
+# Only the rl stack: the repo's pinned core requirements (safetensors 0.5.x)
+# conflict with transformers>=5.13, and rl/ never imports the core lib.
+pip install -q -r rl/requirements.txt
 python -m rl.test_dealer
 
 if [ "$MODE" = server ]; then
