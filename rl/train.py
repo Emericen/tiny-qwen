@@ -205,6 +205,8 @@ def main():
         temperature=1.0,
         max_completion_length=args.max_tokens,
         bf16=torch.cuda.is_available(),
+        # Load weights in bf16 — the fp32 default is 111GB for 27B and evicts vLLM's share.
+        model_init_kwargs={"dtype": "bfloat16"} if torch.cuda.is_available() else None,
         gradient_checkpointing=True,
         logging_steps=1,
         save_steps=args.save_every,
