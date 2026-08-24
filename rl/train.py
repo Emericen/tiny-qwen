@@ -174,6 +174,7 @@ def main():
     parser.add_argument("--vllm", default="colocate", choices=["colocate", "server", "none"])
     parser.add_argument("--vllm-host", default="localhost")
     parser.add_argument("--vllm-port", type=int, default=8000)
+    parser.add_argument("--vllm-mem", type=float, default=0.3, help="colocate: vLLM's share of GPU memory; 27B bf16 weights need ~0.45 of an H200")
     parser.add_argument("--output", default="runs/poker")
     parser.add_argument("--save-every", type=int, default=50)
     parser.add_argument("--report-to", default="none", help="none | wandb | tensorboard")
@@ -204,7 +205,7 @@ def main():
         vllm_mode=args.vllm if args.vllm != "none" else "colocate",
         vllm_server_host=args.vllm_host,
         vllm_server_port=args.vllm_port,
-        vllm_gpu_memory_utilization=0.3,
+        vllm_gpu_memory_utilization=args.vllm_mem,
         log_completions=True,
         num_completions_to_print=1,
         chat_template_kwargs={"enable_thinking": args.thinking},
