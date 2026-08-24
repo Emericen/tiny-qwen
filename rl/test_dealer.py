@@ -6,7 +6,7 @@ the first failure so it can gate a commit.
 
 import random
 
-from rl.dealer import BB, Dealer, FishSeat, evaluate5, evaluate7, parse_card, parse_reply, play_hand, play_match
+from rl.game.dealer import BB, Dealer, FishSeat, evaluate5, evaluate7, parse_card, parse_reply, play_hand, play_match
 
 
 def cards(text):

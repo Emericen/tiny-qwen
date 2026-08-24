@@ -18,7 +18,7 @@ import argparse
 import json
 import urllib.request
 
-from rl.dealer import FishSeat, PolicySeat, STREETS, cards_str, parse_card
+from rl.game.dealer import FishSeat, PolicySeat, STREETS, cards_str, parse_card
 
 HOST = "https://slumbot.com"
 SB = 50

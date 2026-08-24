@@ -18,7 +18,7 @@ import argparse
 
 import torch
 
-from rl.dealer import BB, Dealer, FishSeat, default_action, parse_reply
+from rl.game.dealer import BB, Dealer, FishSeat, default_action, parse_reply
 
 SYSTEM = (
     "You are playing heads-up no-limit Texas hold'em for chips. "

@@ -13,7 +13,7 @@ import json
 import time
 import urllib.request
 
-from rl.dealer import FishSeat, PolicySeat, play_match
+from rl.game.dealer import FishSeat, PolicySeat, play_match
 
 SYSTEM = (
     "You are playing heads-up no-limit Texas hold'em for chips. "

@@ -1,4 +1,7 @@
-# rl/ needs nothing beyond the repo's requirements.txt for the dealer and tests.
+# The dealer and its tests need nothing beyond the repo's requirements.txt.
+# The browser table (rl.game) needs:
+fastapi>=0.115
+uvicorn>=0.34
 # The trainer and the GPU baselines need these (install on the pod, see pod.sh):
 transformers>=5.13
 trl>=1.10

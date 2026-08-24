@@ -17,7 +17,6 @@ Secrets (the opponent's hole cards) only ever live inside Dealer. Seats see
 text observations, never the Dealer object.
 """
 
-import argparse
 import itertools
 import random
 import re
@@ -421,20 +420,6 @@ class FishSeat:
         return self.rng.choice(legal), ""  # "random"
 
 
-class HumanSeat:
-    def __init__(self):
-        self.invalid = 0
-
-    def act(self, observation, legal):
-        print("\n" + observation)
-        while True:
-            reply = input("> ")
-            action, say = parse_reply(reply, legal)
-            if action is not None:
-                return action, say
-            print(f"not legal; choose from: {', '.join(legal)}")
-
-
 class PolicySeat:
     """Wraps any text -> text function (a language model) as a seat."""
 
@@ -500,29 +485,3 @@ def play_match(make_a, make_b, hands=100, seed=0, mirrored=True, talk=False):
         "invalid_rate_b": getattr(b, "invalid", 0) / max(1, getattr(b, "decisions", played)),
     }
     return stats
-
-
-def main():
-    parser = argparse.ArgumentParser(description="play heads-up NLHE in the terminal")
-    parser.add_argument("--vs", default="station", choices=["station", "nit", "maniac", "random"])
-    parser.add_argument("--hands", type=int, default=0, help="0 = play as a human")
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--talk", action="store_true")
-    args = parser.parse_args()
-    if args.hands == 0:
-        total = 0.0
-        n = 0
-        while True:
-            dealer = Dealer(args.seed + n, button=n % 2, talk=args.talk)
-            deltas = play_hand(dealer, [HumanSeat(), FishSeat(args.vs, seed=n)])
-            print(dealer.observation(0).split("\n")[-1])
-            total += deltas[0]
-            n += 1
-            print(f"running total: {total / BB:+.1f} bb over {n} hands")
-        return
-    stats = play_match(lambda: FishSeat("random", seed=1), lambda: FishSeat(args.vs, seed=2), hands=args.hands, seed=args.seed)
-    print(stats)
-
-
-if __name__ == "__main__":
-    main()
