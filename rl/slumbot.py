@@ -203,6 +203,7 @@ def main():
     parser.add_argument("--url", default="", help="openai backend: chat completions URL")
     parser.add_argument("--api-key", default="")
     parser.add_argument("--thinking", action="store_true")
+    parser.add_argument("--max-new-tokens", type=int, default=768, help="tight caps silently truncate big-pot decisions into forced folds")
     parser.add_argument("--show", type=int, default=1)
     args = parser.parse_args()
 
@@ -212,11 +213,11 @@ def main():
         from rl.play import hf_generator, openai_generator, vllm_generator
 
         if args.backend == "hf":
-            generate = hf_generator(args.model, thinking=args.thinking)
+            generate = hf_generator(args.model, max_new_tokens=args.max_new_tokens, thinking=args.thinking)
         elif args.backend == "openai":
-            generate = openai_generator(args.url, args.model, args.api_key, thinking=args.thinking)
+            generate = openai_generator(args.url, args.model, args.api_key, args.max_new_tokens, thinking=args.thinking)
         else:
-            generate = vllm_generator(args.model, thinking=args.thinking)
+            generate = vllm_generator(args.model, max_new_tokens=args.max_new_tokens, thinking=args.thinking)
         seat = ToolSeat(generate)
 
     token = None
