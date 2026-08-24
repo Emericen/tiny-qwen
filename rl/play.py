@@ -101,8 +101,17 @@ def openai_generator(url, model, api_key="", max_new_tokens=128, temperature=1.0
             data=json.dumps(body).encode(),
             headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
         )
-        with urllib.request.urlopen(request, timeout=60) as response:
-            data = json.load(response)
+        # Reasoning models can think past 60s, and one transient network error must not
+        # kill a paid run — retry twice, then let the caller's progress log keep the data.
+        data = None
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(request, timeout=240) as response:
+                    data = json.load(response)
+                break
+            except (TimeoutError, urllib.error.URLError):
+                if attempt == 2:
+                    raise
         u = data.get("usage") or {}
         prompt_tokens = int(u.get("prompt_tokens") or 0)
         usage["in"] += prompt_tokens
