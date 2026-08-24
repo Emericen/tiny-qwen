@@ -217,6 +217,8 @@ def main():
         vllm_server_host=args.vllm_host,
         vllm_server_port=args.vllm_port,
         vllm_gpu_memory_utilization=args.vllm_mem,
+        # A hand is a few thousand tokens; without this vLLM reserves KV for the full 262k context.
+        vllm_max_model_length=8192,
         log_completions=True,
         num_completions_to_print=1,
         chat_template_kwargs={"enable_thinking": args.thinking},
