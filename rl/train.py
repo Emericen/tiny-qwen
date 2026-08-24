@@ -175,6 +175,7 @@ def main():
     parser.add_argument("--gens", type=int, default=8, help="rollouts per deal (GRPO group size)")
     parser.add_argument("--deals", type=int, default=4096, help="distinct deals in the dataset")
     parser.add_argument("--accum", type=int, default=2)
+    parser.add_argument("--micro-batch", type=int, default=0, help="completions per backward pass; 0 = gens. Lower for big models — the logits tensor is tokens x 248k vocab.")
     parser.add_argument("--lr", type=float, default=1e-6)
     parser.add_argument("--max-tokens", type=int, default=1024, help="completion budget for the whole hand")
     parser.add_argument("--lora-r", type=int, default=16, help="0 = full-parameter")
@@ -199,8 +200,9 @@ def main():
         output_dir=args.output,
         max_steps=args.steps,
         num_generations=args.gens,
-        per_device_train_batch_size=args.gens,
-        gradient_accumulation_steps=args.accum,
+        per_device_train_batch_size=args.micro_batch or args.gens,
+        # Same episodes per optimizer step either way; micro-batching only splits the backward.
+        gradient_accumulation_steps=args.accum * (args.gens // args.micro_batch if args.micro_batch else 1),
         learning_rate=args.lr,
         temperature=1.0,
         max_completion_length=args.max_tokens,
