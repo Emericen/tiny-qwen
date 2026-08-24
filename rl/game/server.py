@@ -22,6 +22,7 @@ import threading
 import time
 import urllib.request
 import webbrowser
+import zlib
 from pathlib import Path
 
 import uvicorn
@@ -29,15 +30,10 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from rl.game.dealer import BB, Dealer, FishSeat, PolicySeat, cards_str
+from rl.game.dealer import BB, Dealer, FishSeat, cards_str
+from rl.toolcall import ACT_TOOL, SYSTEM, ToolSeat
 
 FISH_STYLES = ("station", "nit", "maniac", "random")
-
-SYSTEM = (
-    "You are playing heads-up no-limit Texas hold'em for chips. "
-    "Read the state and reply with exactly one legal action copied from the list. "
-    "You may add one more line starting with 'say:' to talk to your opponent."
-)
 
 
 def api_seat(model, url, api_key, temperature=1.0, max_tokens=200):
@@ -50,6 +46,7 @@ def api_seat(model, url, api_key, temperature=1.0, max_tokens=200):
                 {"role": "system", "content": SYSTEM},
                 {"role": "user", "content": observation},
             ],
+            "tools": [ACT_TOOL],
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
@@ -60,9 +57,9 @@ def api_seat(model, url, api_key, temperature=1.0, max_tokens=200):
         )
         with urllib.request.urlopen(request, timeout=120) as response:
             data = json.load(response)
-        return data["choices"][0]["message"]["content"]
+        return data["choices"][0]["message"]
 
-    return PolicySeat(generate)
+    return ToolSeat(generate)
 
 
 def make_seat(spec, key):
@@ -77,7 +74,7 @@ def make_seat(spec, key):
     style = spec.removeprefix("fish:")
     if style not in FISH_STYLES:
         raise SystemExit(f"unknown seat spec {spec!r}; use human, {', '.join(FISH_STYLES)}, or api:<model>@<url>")
-    return FishSeat(style, seed=hash(spec) % 1000), f"fish ({style})"
+    return FishSeat(style, seed=zlib.crc32(spec.encode()) % 1000), f"fish ({style})"
 
 
 class Table:
@@ -144,7 +141,7 @@ class Table:
         ][-8:]
         if lines:
             obs += "\nTable talk so far:\n" + "\n".join(lines)
-        return obs + '\nYou may add table talk on a second line: say: <message>'
+        return obs + "\nYou may talk to the table via the `say` argument of your act call."
 
     def _settle(self):
         """Add the finished hand to the totals and the thread, exactly once."""

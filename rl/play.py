@@ -13,13 +13,8 @@ import json
 import time
 import urllib.request
 
-from rl.game.dealer import FishSeat, PolicySeat, play_match
-
-SYSTEM = (
-    "You are playing heads-up no-limit Texas hold'em for chips. "
-    "Read the state and reply with exactly one legal action copied from the list. "
-    "You may add one more line starting with 'say:' to talk to your opponent."
-)
+from rl.game.dealer import FishSeat, play_match
+from rl.toolcall import ACT_TOOL, SYSTEM, ToolSeat, configure_tool_parsing, parse_message
 
 
 def messages_for(observation):
@@ -29,7 +24,7 @@ def messages_for(observation):
     ]
 
 
-def hf_generator(model_path, device=None, max_new_tokens=32, thinking=False, temperature=1.0):
+def hf_generator(model_path, device=None, max_new_tokens=128, thinking=False, temperature=1.0):
     import torch
     from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoTokenizer
 
@@ -37,6 +32,7 @@ def hf_generator(model_path, device=None, max_new_tokens=32, thinking=False, tem
         device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     dtype = torch.bfloat16 if device == "cuda" else torch.float16 if device == "mps" else torch.float32
     tokenizer = AutoTokenizer.from_pretrained(model_path)
+    configure_tool_parsing(tokenizer)
     try:
         model = AutoModelForImageTextToText.from_pretrained(model_path, dtype=dtype)
     except Exception:
@@ -46,7 +42,7 @@ def hf_generator(model_path, device=None, max_new_tokens=32, thinking=False, tem
 
     def generate(observation):
         text = tokenizer.apply_chat_template(
-            messages_for(observation), tokenize=False, add_generation_prompt=True, enable_thinking=thinking
+            messages_for(observation), tools=[ACT_TOOL], tokenize=False, add_generation_prompt=True, enable_thinking=thinking
         )
         inputs = tokenizer(text, return_tensors="pt").to(device)
         with torch.no_grad():
@@ -58,31 +54,36 @@ def hf_generator(model_path, device=None, max_new_tokens=32, thinking=False, tem
                 top_p=1.0,
             )
         new_tokens = out[0][inputs["input_ids"].shape[1]:]
-        return tokenizer.decode(new_tokens, skip_special_tokens=True)
+        return parse_message(tokenizer, new_tokens.tolist(), inputs["input_ids"][0].tolist())
 
     return generate
 
 
-def vllm_generator(model_path, max_new_tokens=32, thinking=False, temperature=1.0):
+def vllm_generator(model_path, max_new_tokens=128, thinking=False, temperature=1.0):
     from vllm import LLM, SamplingParams
 
     llm = LLM(model=model_path, max_model_len=4096, gpu_memory_utilization=0.6)
+    tokenizer = llm.get_tokenizer()
+    configure_tool_parsing(tokenizer)
     params = SamplingParams(max_tokens=max_new_tokens, temperature=temperature, top_p=1.0)
 
     def generate(observation):
-        out = llm.chat(messages_for(observation), params, chat_template_kwargs={"enable_thinking": thinking})
-        return out[0].outputs[0].text
+        out = llm.chat(
+            messages_for(observation), params, tools=[ACT_TOOL], chat_template_kwargs={"enable_thinking": thinking}
+        )
+        return parse_message(tokenizer, list(out[0].outputs[0].token_ids), list(out[0].prompt_token_ids))
 
     return generate
 
 
-def openai_generator(url, model, api_key="", max_new_tokens=32, temperature=1.0):
+def openai_generator(url, model, api_key="", max_new_tokens=128, temperature=1.0):
     """Any OpenAI-compatible chat endpoint: a frontier model, a local server, or OpenMNK's /v1."""
 
     def generate(observation):
         body = {
             "model": model,
             "messages": messages_for(observation),
+            "tools": [ACT_TOOL],
             "max_tokens": max_new_tokens,
             "temperature": temperature,
         }
@@ -93,23 +94,24 @@ def openai_generator(url, model, api_key="", max_new_tokens=32, temperature=1.0)
         )
         with urllib.request.urlopen(request, timeout=60) as response:
             data = json.load(response)
-        return data["choices"][0]["message"]["content"]
+        return data["choices"][0]["message"]
 
     return generate
 
 
 def showing(generate, hands_to_show):
     """Wrap a generator so the first N hands' observations and replies are printed."""
-    state = {"hand": 0, "printed": 0}
+    state = {"hand": 0}
 
     def generate_and_print(observation):
-        reply = generate(observation)
+        message = generate(observation)
         if observation.startswith("Heads-up") and "blinds posted." in observation:
             state["hand"] += 1
         if state["hand"] <= hands_to_show:
             print("\n--- observation ---\n" + observation)
-            print("--- reply ---\n" + reply.strip())
-        return reply
+            shown = {k: message.get(k) for k in ("content", "tool_calls") if message.get(k)}
+            print("--- reply ---\n" + json.dumps(shown, indent=2, default=str))
+        return message
 
     return generate_and_print
 
@@ -126,7 +128,7 @@ def main():
     parser.add_argument("--talk", action="store_true")
     parser.add_argument("--thinking", action="store_true")
     parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--max-new-tokens", type=int, default=32)
+    parser.add_argument("--max-new-tokens", type=int, default=128, help="room for the XML tool-call wrapper")
     parser.add_argument("--show", type=int, default=1, help="print transcripts of the first N hands")
     parser.add_argument("--device", default=None)
     args = parser.parse_args()
@@ -139,7 +141,7 @@ def main():
         generate = openai_generator(args.url, args.model, args.api_key, args.max_new_tokens, args.temperature)
     generate = showing(generate, args.show)
 
-    policy = PolicySeat(generate)
+    policy = ToolSeat(generate)
     start = time.time()
     stats = play_match(lambda: policy, lambda: FishSeat(args.vs, seed=args.seed), hands=args.hands, seed=args.seed, talk=args.talk)
     elapsed = time.time() - start

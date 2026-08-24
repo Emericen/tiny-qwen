@@ -18,7 +18,8 @@ import argparse
 import json
 import urllib.request
 
-from rl.game.dealer import FishSeat, PolicySeat, STREETS, cards_str, parse_card
+from rl.game.dealer import FishSeat, STREETS, cards_str, parse_card
+from rl.toolcall import ToolSeat
 
 HOST = "https://slumbot.com"
 SB = 50
@@ -212,7 +213,7 @@ def main():
             generate = hf_generator(args.model, thinking=args.thinking)
         else:
             generate = vllm_generator(args.model, thinking=args.thinking)
-        seat = PolicySeat(generate)
+        seat = ToolSeat(generate)
 
     token = None
     total = 0

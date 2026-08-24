@@ -19,13 +19,14 @@ VLLM_GPU=${VLLM_GPU:-0}
 TRAIN_GPU=${TRAIN_GPU:-0}
 OUT=${OUT:-runs/$(basename "$MODEL")-$VS}
 EXTRA=${EXTRA:-}
+mkdir -p "$(dirname "$OUT")"
 
 pip install -q -r requirements.txt -r rl/requirements.txt
 python -m rl.test_dealer
 
 if [ "$MODE" = server ]; then
   CUDA_VISIBLE_DEVICES=$VLLM_GPU VLLM_SERVER_DEV_MODE=1 vllm serve "$MODEL" \
-    --enable-auto-tool-choice --tool-call-parser hermes \
+    --enable-auto-tool-choice --tool-call-parser qwen3_xml \
     --logprobs-mode processed_logprobs --return-tokens-as-token-ids \
     --weight-transfer-config '{"backend":"nccl"}' \
     --gpu-memory-utilization 0.35 --max-model-len 4096 --port 8000 > "$OUT.vllm.log" 2>&1 &
