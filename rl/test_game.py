@@ -6,7 +6,7 @@ the first failure so it can gate a commit.
 
 import random
 
-from rl.game.game import (
+from rl.poker.game import (
     Dealer,
     FishSeat,
     Hand,
