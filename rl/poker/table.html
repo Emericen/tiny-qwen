@@ -97,6 +97,10 @@
 </div>
 <script>
 const SUIT = { s: "♠", h: "♥", d: "♦", c: "♣" };
+// who and where we are come from the URL: /?seat=0&table=main (no seat = spectator)
+const QS = new URLSearchParams(location.search);
+const SEAT = QS.has("seat") ? +QS.get("seat") : null;
+const TABLE = QS.get("table") || "main";
 let chatLen = -1;
 
 function el(id) { return document.getElementById(id); }
@@ -121,7 +125,7 @@ function seatHtml(s, seat) {
 }
 
 function render(s) {
-  const me = s.human ?? 0, opp = 1 - me;
+  const me = s.you ?? 0, opp = 1 - me;
 
   el("top-cards").innerHTML = s.hole[opp].map(c => cardHtml(c, false)).join("");
   el("top-pod").outerHTML = seatHtml(s, opp).replace('class="seat', 'id="top-pod" class="seat');
@@ -144,7 +148,7 @@ function render(s) {
         : a.action === "check" || a.action === "call" ? "a-" + a.action : "a-raise";
       const n = a.n !== null && a.label !== "Call" ? `<small>${a.n}</small>` : "";
       const label = a.label === "Call" ? `Call ${a.n}` : a.label;
-      return `<button class="${cls}" onclick="play('${a.action}')">${label}${n}</button>`;
+      return `<button class="${cls}" onclick="play(${a.total})">${label}${n}</button>`;
     }).join("");
   } else {
     controls.innerHTML = "";
@@ -156,7 +160,7 @@ function render(s) {
     ? el("left").offsetHeight + "px" : "";
   const resized = el("chat-wrap").style.height !== wrapH;
   el("chat-wrap").style.height = wrapH;
-  el("chat-row").style.display = s.talk && s.human !== null ? "flex" : "none";
+  el("chat-row").style.display = s.talk && s.you !== null ? "flex" : "none";
   if (s.chat.length !== chatLen || resized) {
     chatLen = s.chat.length;
     el("chat").innerHTML = s.chat.map(m =>
@@ -169,13 +173,14 @@ function render(s) {
   }
 }
 
-async function play(action) {
+async function play(total) {  // total: cumulative chips this hand; null = fold
   await fetch("act", { method: "POST", headers: { "Content-Type": "application/json" },
-                       body: JSON.stringify({ action }) });
+                       body: JSON.stringify({ seat: SEAT, total, table: TABLE }) });
 }
 
 async function post(path) {
-  await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+  await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({ table: TABLE }) });
 }
 
 async function sendChat() {
@@ -183,11 +188,11 @@ async function sendChat() {
   if (!text) return;
   box.value = "";
   await fetch("chat", { method: "POST", headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ text }) });
+                        body: JSON.stringify({ seat: SEAT, text, table: TABLE }) });
 }
 el("chat-in").addEventListener("keydown", e => { if (e.key === "Enter") sendChat(); });
 el("chat-send").addEventListener("click", sendChat);
 
 // the stream: the server pushes a snapshot on every game event
-new EventSource("events").onmessage = (e) => render(JSON.parse(e.data));
+new EventSource("events" + location.search).onmessage = (e) => render(JSON.parse(e.data));
 </script>

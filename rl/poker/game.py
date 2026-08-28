@@ -1,21 +1,24 @@
 """
-Poker in four nouns:
+Poker in three files:
 
-    game.py      THE GAME:    state per the rules — pure library, no entry point
-    seat.py      THE PLAYERS: one Seat class (human, fish, model) answering views
-    server.py    THE DOOR:    FastAPI + SSE — streams views out, takes actions in
-    table.html   THE GLASS:   renders what the door streams
+    game.py      the rules and the state: cards, scoring, Hand (one episode),
+                 Game (one table: chips, button, score, chat, the clock, and
+                 every view of the state)
+    server.py    a small FastAPI wrapper whose state is a map of Games — SSE
+                 streams views out, POST /act {seat, total} brings actions in;
+                 fish NPCs sit at the bottom as a convenience
+    table.html   a frontend rendering what the server streams (2-player tables)
 
-This file is data structures per the game's rules and nothing else: cards and
-scoring, one Hand (an episode), the Dealer (the game across hands: chips,
-button, score, chat), and the Table — the async loop that assembles per-seat
-views, awaits whoever's turn it is, and notifies subscribers on every event.
-It imports nothing above it and knows nothing of HTTP, models, or pixels.
+The game does not know who sits behind a seat. Humans, NPCs, and models are
+all just clients that watch the stream and post a number when it is their
+turn; decision policies live with the training code (rl/model_player.py),
+not here. game.py imports nothing above the standard library.
 
 The engine speaks ONE action: your cumulative chip total for the hand
 (None = fold). check / call / bet / raise / all-in are presentation-layer
-words for particular numbers. Cards are emoji strings ("♠A") for humans and
-converted to ASCII ("As") at the model/browser boundary.
+words for particular numbers — labeled_legal() hands every client the words
+WITH their numbers, so nothing ever converts words back. Cards are emoji
+strings ("♠A") internally and ASCII ("As") at the API boundary.
 
 DEVIATION (documented): every all-in re-opens the action, even below a full
 raise — real poker's incomplete-raise rule is dropped for legibility.
@@ -32,6 +35,7 @@ from collections import Counter
 
 SMALL_BLIND, BIG_BLIND = 1, 2
 CARDS_REVEALED = (0, 3, 4, 5)  # per street: preflop, flop, turn, river
+STREETS = ("preflop", "flop", "turn", "river")
 RANKS = "23456789TJQKA"
 SUITS = "♣♦♥♠"
 
@@ -41,7 +45,7 @@ SUIT_ASCII = {"♣": "c", "♦": "d", "♥": "h", "♠": "s"}
 
 
 def card_ascii(card: str) -> str:
-    """'♠A' -> 'As', '♥10' -> 'Th' — the format models and table.html speak."""
+    """'♠A' -> 'As', '♥10' -> 'Th' — the format the API boundary speaks."""
     rank = card[1:]
     return ("T" if rank == "10" else rank) + SUIT_ASCII[card[0]]
 
@@ -230,17 +234,19 @@ class Hand:
 
 
 def labeled_legal(hand: Hand) -> list[dict]:
-    """The acting seat's menu as poker words. The browser buttons and the
-    model prompt both consume this, so the two can never disagree."""
+    """The acting seat's menu: poker words for particular numbers. Every entry
+    carries its number ("total", None = fold) — clients post that back
+    verbatim, so nothing anywhere converts words to numbers. "n" is display
+    detail: the call cost, or the raise total."""
     seat = hand.acting_seat
     match, escalation = hand.legal_totals()
     cost = match - hand.bets[seat]
     menu = []
     if cost > 0:
-        menu.append({"action": "fold", "label": "Fold", "n": None})
-        menu.append({"action": "call", "label": "Call", "n": cost})
+        menu.append({"action": "fold", "label": "Fold", "n": None, "total": None})
+        menu.append({"action": "call", "label": "Call", "n": cost, "total": match})
     else:
-        menu.append({"action": "check", "label": "Check", "n": None})
+        menu.append({"action": "check", "label": "Check", "n": None, "total": match})
     if escalation:
         price = max(hand.bets)
         pot_now = sum(hand.bets) + cost
@@ -252,31 +258,47 @@ def labeled_legal(hand: Hand) -> list[dict]:
                 sizes.setdefault(n, label)
         for n, label in sorted(sizes.items()):
             if n != all_in:
-                menu.append({"action": f"raise {n}", "label": label, "n": n})
-        menu.append({"action": "allin", "label": "All-in", "n": all_in})
+                menu.append({"action": f"raise {n}", "label": label, "n": n, "total": n})
+        menu.append({"action": "allin", "label": "All-in", "n": all_in, "total": all_in})
     return menu
 
 
 # ---------------------------------------------------------------------------
-# Dealer: the game across hands — chips, button, score, and the chat thread
+# Game: one table — chips, button, score, chat, the clock, the views
 # ---------------------------------------------------------------------------
 
 
-class Dealer:
-    """Owns the chips, rotates the button (by seat-flipping, two players),
-    keeps the running score, and holds the chat thread — the append-only
-    ground truth every view (browser, prompt, log) slices."""
+class Game:
+    """The game across hands at one table, any number of seats. Owns the
+    chips, rotates the button, keeps the score and the chat thread, runs the
+    clock, and serves every view of itself. It does NOT know who sits behind
+    a seat: every action arrives from outside as give(seat, total), whether
+    the sender is a browser, an NPC, or a model. Consumers learn of changes
+    via a version counter: await wait_past(v)."""
 
-    def __init__(self, names: list[str], chips: int = 200, seed: int = 0):
-        self.names = names
+    def __init__(self, names: list[str], chips: int = 200, seed: int = 0,
+                 talk: bool = True, auto_deal: bool = False, pause: float = 2.4):
+        self.names = list(names)
+        self.n = len(self.names)
+        self.talk = talk
+        self.auto_deal = auto_deal  # next hand on a timer, vs on request_new()
+        self.pause = pause  # seconds a finished hand stays up when auto-dealing
         self.chips = chips
-        self.stacks = [chips, chips]  # physical player order, stable across hands
-        self.totals = [0.0, 0.0]  # score in bb, physical order
-        self.chat = []  # {"seat": physical | None, "who", "text", "kind"}
         self.seed = seed
+        self.stacks = [chips] * self.n  # physical player order, stable across hands
+        self.totals = [0.0] * self.n  # score in bb, physical order
+        self.chat = []  # {"seat": physical | None, "who", "text", "kind"}
         self.hand_no = 0
-        self.flip = 0  # physical index of the button; hand seat = physical ^ flip
+        self.button = 0  # physical index holding the button this hand
         self.hand: Hand | None = None
+        self.version = 0
+        self._changed = asyncio.Condition()
+        self._actions: asyncio.Queue = asyncio.Queue()  # (seat, total) via give()
+        self._new_request = asyncio.Event()
+        self._base_key = None
+        self.new_hand()
+
+    # -- the chat thread: append-only ground truth ---------------------------
 
     def line(self, seat: int | None, text: str, kind: str):
         who = self.names[seat] if seat is not None else "dealer"
@@ -287,89 +309,66 @@ class Dealer:
         if text:
             self.line(seat, text, "talk")
 
+    # -- seat geometry: hand seat 0 is always the button ---------------------
+
     def physical(self, hand_seat: int) -> int:
-        return hand_seat ^ self.flip
+        return (self.button + hand_seat) % self.n
 
     def hand_seat(self, physical: int) -> int:
-        return physical ^ self.flip
+        return (physical - self.button) % self.n
+
+    # -- hands ---------------------------------------------------------------
 
     def new_hand(self) -> Hand:
         self.hand_no += 1
-        self.flip = (self.hand_no - 1) % 2
-        if min(self.stacks) == 0:  # busted: fresh stacks, the score keeps the truth
-            self.stacks = [self.chips, self.chips]
+        self.button = (self.hand_no - 1) % self.n
+        if min(self.stacks) == 0:  # busted players rebuy; the score keeps the truth
+            self.stacks = [s if s > 0 else self.chips for s in self.stacks]
             self.line(None, "— rebuy: fresh stacks —", "deal")
         self._before = self.stacks.copy()
-        self.hand = Hand([self.stacks[self.flip], self.stacks[1 - self.flip]], seed=self.seed + self.hand_no)
+        self.hand = Hand([self.stacks[self.physical(s)] for s in range(self.n)], seed=self.seed + self.hand_no)
         self.line(None, f"— hand {self.hand_no} —", "deal")
         if self.hand_no > 1:
-            score = " · ".join(f"{self.names[i]} {self.totals[i]:+.1f} bb" for i in (0, 1))
+            score = " · ".join(f"{self.names[i]} {self.totals[i]:+.1f} bb" for i in range(self.n))
             self.line(None, score, "score")
         return self.hand
 
     def collect(self) -> list[int]:
-        """Fold the finished hand back into the game; returns chip deltas."""
-        for hand_seat in (0, 1):
+        """Fold the finished hand back into the table; returns chip deltas."""
+        for hand_seat in range(self.n):
             self.stacks[self.physical(hand_seat)] = self.hand.stacks[hand_seat]
-        deltas = [self.stacks[i] - self._before[i] for i in (0, 1)]
-        for i in (0, 1):
+        deltas = [self.stacks[i] - self._before[i] for i in range(self.n)]
+        for i in range(self.n):
             self.totals[i] += deltas[i] / BIG_BLIND
         return deltas
 
+    # -- change signal: no registry, just a version --------------------------
 
-# ---------------------------------------------------------------------------
-# Table: the loop — views out, answers in, subscribers notified. Async, pure.
-# ---------------------------------------------------------------------------
+    async def _notify(self):
+        async with self._changed:
+            self.version += 1
+            self._changed.notify_all()
 
+    async def wait_past(self, version: int) -> int:
+        """Park until the table has changed past `version`; return the new one."""
+        async with self._changed:
+            await self._changed.wait_for(lambda: self.version > version)
+            return self.version
 
-class Table:
-    """Assembles per-seat views, awaits whoever's turn it is (the Seat
-    protocol: await act(view) -> (commit_to, say)), applies answers, narrates
-    into the chat thread, and pings subscriber queues on every event. The
-    game's clock lives here — the display just watches."""
+    # -- inputs from the server ----------------------------------------------
 
-    def __init__(self, seats: list, names: list[str] | None = None, chips: int = 200,
-                 seed: int = 0, talk: bool = True, pace: float = 0.8):
-        self.seats = seats  # physical order; protocol objects (see seat.py)
-        names = names or [getattr(s, "name", f"seat {i}") for i, s in enumerate(seats)]
-        self.human = next((i for i, s in enumerate(seats) if getattr(s, "is_human", False)), None)
-        self.watch = self.human is None
-        self.talk = talk
-        self.pace = pace
-        self.dealer = Dealer(names, chips, seed)
-        self.subscribers: set[asyncio.Queue] = set()
-        self._new_request = asyncio.Event()
-        self._base_key = None
-        self.dealer.new_hand()
-
-    # -- subscriptions (the door hangs its streams here) ---------------------
-
-    def subscribe(self) -> asyncio.Queue:
-        queue = asyncio.Queue()
-        self.subscribers.add(queue)
-        return queue
-
-    def unsubscribe(self, queue: asyncio.Queue):
-        self.subscribers.discard(queue)
-
-    def _notify(self):
-        for queue in list(self.subscribers):
-            queue.put_nowait(True)
-
-    # -- inputs from the door ------------------------------------------------
-
-    def give(self, action: str):
-        """Route the human's click to their seat — only when it's their turn."""
-        hand = self.dealer.hand
-        if self.human is None or hand.acting_seat is None:
+    def give(self, seat: int, total: int | None):
+        """An action arrives for `seat`. Accepted only when it is that seat's
+        turn — anything else is a stale or confused client and is dropped."""
+        if self.hand.acting_seat is None:
             return
-        if self.dealer.physical(hand.acting_seat) == self.human:
-            self.seats[self.human].give(action)
+        if self.physical(self.hand.acting_seat) == seat:
+            self._actions.put_nowait((seat, total))
 
-    def post_chat(self, text: str):
-        if self.human is not None and text.strip():
-            self.dealer.say(self.human, text.strip())
-            self._notify()
+    async def post_chat(self, seat: int, text: str):
+        if 0 <= seat < self.n and text.strip():
+            self.say(seat, text.strip())
+            await self._notify()
 
     def request_new(self):
         self._new_request.set()
@@ -377,36 +376,31 @@ class Table:
     # -- the clock -----------------------------------------------------------
 
     async def run(self):
-        """The game runs itself; viewers merely render what they're told."""
-        self._notify()
+        """The table runs itself: park until the acting seat's number arrives,
+        apply it, broadcast. Who produced the number is not the game's business."""
+        await self._notify()
         while True:
-            hand = self.dealer.hand
+            hand = self.hand
             if hand.acting_seat is None:  # hand over: deal the next one
-                if self.watch:
-                    await asyncio.sleep(self.pace * 3)
+                if self.auto_deal:
+                    await asyncio.sleep(self.pause)
                 else:
                     await self._new_request.wait()
                     self._new_request.clear()
-                self.dealer.new_hand()
-                self._notify()
+                self.new_hand()
+                await self._notify()
                 continue
-            physical = self.dealer.physical(hand.acting_seat)
-            seat = self.seats[physical]
-            total, say = await seat.act(self._view(physical))
+            seat, total = await self._actions.get()
+            if seat != self.physical(hand.acting_seat):
+                continue  # queued before the turn moved on
             try:
-                self._apply(physical, total, say)
+                self._apply(seat, total)
             except ValueError:
-                if getattr(seat, "is_human", False):
-                    continue  # stale or garbage click; re-await a fresh one
-                raise
-            self._notify()
-            if not getattr(seat, "is_human", False) and self.pace:
-                await asyncio.sleep(self.pace)
+                continue  # an illegal number from a stale view; keep waiting
+            await self._notify()
 
-    # -- driving the hand ----------------------------------------------------
-
-    def _apply(self, physical: int, total: int | None, say: str):
-        hand = self.dealer.hand
+    def _apply(self, physical: int, total: int | None):
+        hand = self.hand
         match, escalation = hand.legal_totals()
         cost = match - hand.bets[hand.acting_seat]
         if total is None:  # narrate with the word the number means
@@ -419,98 +413,65 @@ class Table:
             word = f"raise {total}"
         street_before = hand.street
         hand.step(total)
-        if self.talk and say:
-            self.dealer.say(physical, say)
-        self.dealer.line(physical, word, "act")
+        self.line(physical, word, "act")
         if hand.acting_seat is not None and hand.street > street_before:
-            street = ["preflop", "flop", "turn", "river"][hand.street]
-            self.dealer.line(None, f"{street}: {' '.join(hand.revealed())}", "deal")
+            self.line(None, f"{STREETS[hand.street]}: {' '.join(hand.revealed())}", "deal")
         if hand.acting_seat is None:
             self._settle_narration()
 
     def _settle_narration(self):
-        deltas = self.dealer.collect()
-        winner = 0 if deltas[0] > 0 else 1
-        hand = self.dealer.hand
-        if deltas[0] == deltas[1] == 0:
-            self.dealer.line(None, "Split pot.", "deal")
+        deltas = self.collect()
+        if all(d == 0 for d in deltas):
+            self.line(None, "Split pot.", "deal")
             return
-        if any(hand.folded):
-            how = f"{self.dealer.names[self.dealer.physical(hand.folded.index(True))]} folded"
-        else:
-            how = "showdown"
-        self.dealer.line(None, f"{self.dealer.names[winner]} wins {deltas[winner]} chips ({how}).", "deal")
+        how = "showdown" if self.hand.folded.count(False) > 1 else "everyone else folded"
+        winners = ", ".join(f"{self.names[i]} +{d}" for i, d in enumerate(deltas) if d > 0)
+        self.line(None, f"{winners} chips ({how}).", "deal")
 
     # -- views ---------------------------------------------------------------
 
-    def _view(self, physical: int) -> dict:
-        """What the acting seat may know. Built only for the seat to act —
-        match/escalation/menu are that seat's numbers."""
-        hand = self.dealer.hand
-        seat = self.dealer.hand_seat(physical)
-        match, escalation = hand.legal_totals()
-        return {
-            "seat": seat,
-            "name": self.dealer.names[physical],
-            "player_count": hand.player_count,
-            "street": hand.street,
-            "board": hand.revealed(),
-            "hole": hand.holes[seat],
-            "stacks": hand.stacks,
-            "bets": hand.bets,
-            "pot": sum(hand.bets),
-            "price": max(hand.bets),
-            "match": match,
-            "cost": match - hand.bets[seat],
-            "escalation": [escalation.start, escalation[-1]] if escalation else None,
-            "menu": labeled_legal(hand),
-            "chat": [
-                {"who": e["who"], "text": e["text"]}
-                for e in self.dealer.chat
-                if e["kind"] == "talk"
-            ][-8:],
-            "talk": self.talk,
-        }
-
-    # -- the JSON contract table.html speaks ---------------------------------
-
     def _street_base(self) -> list[int]:
         """bets snapshot at street start, for drawing carried-pot vs live bets."""
-        hand = self.dealer.hand
-        key = (self.dealer.hand_no, hand.street)
+        key = (self.hand_no, self.hand.street)
         if self._base_key != key:
             self._base_key = key
-            self._base = hand.bets.copy()
+            self._base = self.hand.bets.copy()
         return self._base
 
     def state(self, for_seat: int | None) -> dict:
-        """One subscriber's snapshot. for_seat None = spectator (v1: sees all
-        holes); a seat number sees its own cards until showdown."""
-        dealer, hand = self.dealer, self.dealer.hand
+        """One consumer's snapshot. for_seat None = spectator (v1: sees all
+        holes); a seat number sees its own cards until showdown, plus its menu
+        and prices when it is that seat's turn."""
+        hand = self.hand
         done = hand.acting_seat is None
-        base = [0] * 2 if done else self._street_base()
-        show = [for_seat is None or done or physical == for_seat for physical in (0, 1)]
-        acting_physical = None if done else dealer.physical(hand.acting_seat)
+        base = [0] * self.n if done else self._street_base()
+        show = [for_seat is None or done or p == for_seat for p in range(self.n)]
+        acting_physical = None if done else self.physical(hand.acting_seat)
         your_turn = for_seat is not None and acting_physical == for_seat
+        match, escalation = hand.legal_totals() if your_turn else (None, range(0))
         return {
-            "hand_no": dealer.hand_no,
+            "hand_no": self.hand_no,
             "watch": for_seat is None,
-            "human": for_seat,
-            "names": dealer.names,
+            "you": for_seat,
+            "names": self.names,
+            "blinds": [SMALL_BLIND, BIG_BLIND],
+            "street": hand.street,
             "board": [card_ascii(c) for c in hand.revealed()],
             "pot": sum(base),  # carried pot only — live bets are drawn at the seats
-            "stacks": [hand.stacks[dealer.hand_seat(p)] for p in (0, 1)],
-            "bets": [hand.bets[dealer.hand_seat(p)] - base[dealer.hand_seat(p)] for p in (0, 1)],
+            "stacks": [hand.stacks[self.hand_seat(p)] for p in range(self.n)],
+            "bets": [hand.bets[self.hand_seat(p)] - base[self.hand_seat(p)] for p in range(self.n)],
             "hole": [
-                [card_ascii(c) for c in hand.holes[dealer.hand_seat(p)]] if show[p] else ["?", "?"]
-                for p in (0, 1)
+                [card_ascii(c) for c in hand.holes[self.hand_seat(p)]] if show[p] else ["?", "?"]
+                for p in range(self.n)
             ],
-            "button": dealer.flip,
+            "button": self.button,
             "to_act": acting_physical,
             "your_turn": your_turn,
+            "match": match,
+            "escalation": [escalation.start, escalation[-1]] if escalation else None,
             "legal": labeled_legal(hand) if your_turn else [],
             "done": done,
-            "totals_bb": [round(t, 1) for t in dealer.totals],
-            "chat": [{"who": e["who"], "text": e["text"], "kind": e["kind"]} for e in dealer.chat[-60:]],
+            "totals_bb": [round(t, 1) for t in self.totals],
+            "chat": [{"who": e["who"], "text": e["text"], "kind": e["kind"]} for e in self.chat[-60:]],
             "talk": self.talk,
         }

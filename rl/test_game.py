@@ -1,5 +1,6 @@
 """
-Tests for rl/game/game.py. Run: python -m rl.test_game
+Tests for rl/poker (rules, table, server NPCs) and rl/model_player (the LLM
+client). Run: python -m rl.test_game
 No test framework; each check prints a line and the script exits non-zero on
 the first failure so it can gate a commit.
 """
@@ -7,17 +8,17 @@ the first failure so it can gate a commit.
 import asyncio
 import random
 
+from rl.model_player import ModelPlayer
 from rl.poker.game import (
-    Dealer,
+    Game,
     Hand,
     INT_TO_CARD,
-    Table,
     card_ascii,
     get_5_score,
     get_7_score,
     labeled_legal,
 )
-from rl.poker.seat import Seat
+from rl.poker.server import fish, fish_pick
 
 
 def check(name, condition, detail=""):
@@ -25,6 +26,11 @@ def check(name, condition, detail=""):
     print(f"{status} {name} {detail}")
     if not condition:
         raise SystemExit(1)
+
+
+def acting_state(game: Game) -> dict:
+    """The snapshot the acting seat's client would receive."""
+    return game.state(game.physical(game.hand.acting_seat))
 
 
 def test_cards():
@@ -106,110 +112,140 @@ def test_hand_fuzz():
     check("fuzz: 20,000 hands (2-6 players) conserve money and terminate", True)
 
 
-def make_view(h):
-    m, esc = h.legal_totals()
-    return {
-        "seat": h.acting_seat, "name": "t", "player_count": h.player_count,
-        "street": h.street, "board": h.revealed(), "hole": h.holes[h.acting_seat],
-        "stacks": h.stacks, "bets": h.bets, "pot": sum(h.bets), "price": max(h.bets),
-        "match": m, "cost": m - h.bets[h.acting_seat],
-        "escalation": [esc.start, esc[-1]] if esc else None,
-        "menu": labeled_legal(h), "chat": [], "talk": True,
-    }
-
-
 def test_vocabulary():
-    h = Hand([200, 200], seed=5)
-    view = make_view(h)
-    menu = view["menu"]
+    game = Game(["a", "b"], seed=5)
+    hand = game.hand
+    menu = labeled_legal(hand)
     check("menu starts fold/call facing the blind", [m["action"] for m in menu[:2]] == ["fold", "call"])
+    match, escalation = hand.legal_totals()
     for entry in menu:
-        total = Seat.action_to_total(view, entry["action"])
-        legal = total is None or total == h.legal_totals()[0] or total in h.legal_totals()[1]
-        check(f"menu action {entry['action']!r} round-trips", legal)
-    check("action: raise to N form", Seat.action_to_total(view, "raise to 12") == 12)
-    check("action: allin", Seat.action_to_total(view, "allin") == view["escalation"][1])
+        total = entry["total"]
+        legal = total is None or total == match or total in escalation
+        check(f"menu entry {entry['action']!r} carries a legal total", legal)
+    state = acting_state(game)
+    check("state prices the acting seat", state["match"] == match and state["escalation"] is not None)
+    check("model: raise to N form", ModelPlayer.to_total(state, "raise to 12") == 12)
+    check("model: allin", ModelPlayer.to_total(state, "allin") == state["escalation"][1])
     try:
-        Seat.action_to_total(view, "quack")
+        ModelPlayer.to_total(state, "quack")
         check("unknown action raises", False)
     except ValueError:
         check("unknown action raises", True)
-    prompt = Seat.render_prompt(view)
+    prompt = ModelPlayer.render_prompt(state)
     check("prompt shows ascii cards", "Your hole cards: " in prompt and "♥" not in prompt)
     check("prompt lists the menu", "Legal actions: " in prompt)
 
 
-def test_dealer_session():
-    d = Dealer(["a", "b"], chips=200, seed=7)
-    d.new_hand()
-    check("hand 1: physical 0 has the button", d.flip == 0 and d.physical(0) == 0)
-    while d.hand.acting_seat is not None:
-        d.hand.step(d.hand.legal_totals()[0])
-    d.collect()
-    check("chips conserved through collect", sum(d.stacks) == 400, str(d.stacks))
-    d.new_hand()
-    check("hand 2: button rotated", d.flip == 1 and d.physical(0) == 1)
-    d.say(0, "hello")
-    check("chat is ground truth on the dealer", d.chat[-1]["who"] == "a" and d.chat[-1]["kind"] == "talk")
-    d.stacks = [400, 0]
-    d.new_hand()
-    check("bust triggers a rebuy", d.stacks[0] > 0 and d.stacks[1] > 0 and d.chat[-3]["text"].startswith("— rebuy"), str(d.stacks))
+def test_fish():
+    game = Game(["a", "b"], seed=21)
+    state = acting_state(game)  # facing the blind: fold / call / raises all on the menu
+    rng = random.Random(0)
+    check("station calls", fish_pick(state, "station", rng) == state["match"])
+    check("nit folds to a bet", fish_pick(state, "nit", rng) is None)
+    maniac = fish_pick(state, "maniac", rng)
+    check("maniac escalates", maniac is not None and maniac >= state["escalation"][0])
+    lo, hi = state["escalation"]
+    legal_random = all(
+        (t is None or t == state["match"] or lo <= t <= hi)
+        for t in (fish_pick(state, "random", rng) for _ in range(200))
+    )
+    check("random fish stays legal over 200 picks", legal_random)
+
+
+def test_game_session():
+    g = Game(["a", "b"], chips=200, seed=7)
+    check("hand 1: physical 0 has the button", g.button == 0 and g.physical(0) == 0)
+    while g.hand.acting_seat is not None:
+        g.hand.step(g.hand.legal_totals()[0])
+    g.collect()
+    check("chips conserved through collect", sum(g.stacks) == 400, str(g.stacks))
+    g.new_hand()
+    check("hand 2: button rotated", g.button == 1 and g.physical(0) == 1)
+    g.say(0, "hello")
+    check("chat is ground truth on the game", g.chat[-1]["who"] == "a" and g.chat[-1]["kind"] == "talk")
+    g.stacks = [400, 0]
+    g.new_hand()
+    check("bust triggers a rebuy", g.stacks[0] > 0 and g.stacks[1] > 0, str(g.stacks))
+
+    g3 = Game(["a", "b", "c"], chips=100, seed=8)
+    check("3-player geometry round-trips", all(g3.hand_seat(g3.physical(s)) == s for s in range(3)))
+    while g3.hand.acting_seat is not None:
+        g3.hand.step(g3.hand.legal_totals()[0])
+    g3.collect()
+    check("3-player chips conserved", sum(g3.stacks) == 300, str(g3.stacks))
+    g3.new_hand()
+    check("3-player button rotates", g3.button == 1)
 
 
 def test_table_session():
     async def scenario():
-        table = Table([Seat("maniac"), Seat("station")], chips=200, seed=9, pace=0)
-        clock = asyncio.create_task(table.run())
-        for _ in range(2000):
-            if table.dealer.hand_no > 3:
+        game = Game(["maniac", "station"], chips=200, seed=9, auto_deal=True, pause=0)
+        tasks = [
+            asyncio.create_task(game.run()),
+            asyncio.create_task(fish(game, 0, "maniac", pace=0)),
+            asyncio.create_task(fish(game, 1, "station", pace=0)),
+        ]
+        for _ in range(4000):
+            if game.hand_no > 3:
                 break
             await asyncio.sleep(0)
-        clock.cancel()
-        return table
+        for task in tasks:
+            task.cancel()
+        return game
 
-    table = asyncio.run(scenario())
-    check("the clock plays hands by itself", table.dealer.hand_no > 3, f"hand_no={table.dealer.hand_no}")
-    total = sum(table.dealer.hand.stacks) + sum(table.dealer.hand.bets)
-    check("chips conserved in the live hand", total == sum(table.dealer.stacks) or total == 400, str(total))
-    kinds = {e["kind"] for e in table.dealer.chat}
+    game = asyncio.run(scenario())
+    check("fish clients play hands by themselves", game.hand_no > 3, f"hand_no={game.hand_no}")
+    total = sum(game.hand.stacks) + sum(game.hand.bets)
+    check("chips conserved in the live hand", total == sum(game.stacks) or total == 400, str(total))
+    kinds = {e["kind"] for e in game.chat}
     check("narration present", {"deal", "act"} <= kinds, str(kinds))
-    state = table.state(None)
-    for field in ("board", "stacks", "bets", "hole", "legal", "chat", "pot", "to_act", "done"):
+    state = game.state(None)
+    for field in ("board", "stacks", "bets", "hole", "legal", "chat", "pot", "to_act",
+                  "done", "street", "blinds", "match", "escalation", "you"):
         check(f"state has {field!r}", field in state)
     check("spectator sees both holes", all(cards != ["?", "?"] for cards in state["hole"]))
 
 
-def test_seat_protocol():
+def test_client_protocol():
     async def scenario():
-        table = Table([Seat("human"), Seat("station")], chips=200, seed=11, pace=0)
-        clock = asyncio.create_task(table.run())
+        game = Game(["you", "fish (station)"], chips=200, seed=11)
+        tasks = [
+            asyncio.create_task(game.run()),
+            asyncio.create_task(fish(game, 1, "station", pace=0)),
+        ]
         await asyncio.sleep(0.02)
-        check("clock parks awaiting the human", table.state(0)["your_turn"])
-        view = table._view(0)
-        for field in ("seat", "hole", "board", "match", "cost", "escalation", "menu", "chat", "talk"):
-            check(f"view has {field!r}", field in view)
-        check("human stream hides opponent hole", table.state(0)["hole"][1] == ["?", "?"])
-        check("spectator stream shows both", table.state(None)["hole"][1] != ["?", "?"])
-        subscriber = table.subscribe()
-        table.give("call")
+        check("clock parks awaiting seat 0", game.state(0)["your_turn"])
+        state = game.state(0)
+        for field in ("you", "hole", "board", "match", "escalation", "legal", "chat", "talk"):
+            check(f"acting state has {field!r}", field in state)
+        check("player stream hides opponent hole", game.state(0)["hole"][1] == ["?", "?"])
+        check("spectator stream shows both", game.state(None)["hole"][1] != ["?", "?"])
+        version_before = game.version
+        game.give(0, state["match"])
         await asyncio.sleep(0.02)
-        check("subscriber notified on action", not subscriber.empty())
-        check("play returned to the human", table.state(0)["your_turn"])
-        table.give("raise 4")
+        check("version bumps on action", game.version > version_before)
+        check("play returned to seat 0", game.state(0)["your_turn"])
+        version_watched = game.version
+        waited = asyncio.create_task(game.wait_past(version_watched))
+        game.give(0, 4)
         await asyncio.sleep(0.02)
-        check("raise applied, station answered", sum(table.dealer.hand.bets) >= 8, str(table.dealer.hand.bets))
-        table.give("fold")
+        check("wait_past wakes on change", waited.done() and waited.result() > version_watched)
+        check("raise applied, station answered", sum(game.hand.bets) >= 8, str(game.hand.bets))
+        game.give(1, None)
+        check("wrong-turn deposit dropped at the door", game._actions.empty())
+        game.give(0, None)
         await asyncio.sleep(0.02)
-        check("fold ends the hand", table.dealer.hand.acting_seat is None)
-        table.request_new()
+        check("fold ends the hand", game.hand.acting_seat is None)
+        game.request_new()
         await asyncio.sleep(0.02)
-        check("next hand dealt on request", table.dealer.hand_no == 2)
-        clock.cancel()
+        check("next hand dealt on request", game.hand_no == 2)
+        for task in tasks:
+            task.cancel()
 
     asyncio.run(scenario())
 
 
-def test_model_seat_repair():
+def test_model_player_repair():
     def message(action=None, content=None):
         calls = []
         if action is not None:
@@ -217,32 +253,32 @@ def test_model_seat_repair():
         return {"content": content, "tool_calls": calls}
 
     async def scenario(replies):
-        seat = Seat("api:test-model@http://localhost:1")
+        player = ModelPlayer("test-model", "http://localhost:1")
         script = iter(replies)
 
         async def fake_call(messages):
             return next(script)
 
-        seat._call = fake_call
-        h = Hand([200, 200], seed=13)
-        return seat, await seat.act(make_view(h)), h
+        player._call = fake_call
+        state = Game(["m", "s"], seed=13).state(0)  # seat 0 to act, facing the blind
+        return player, await player.decide(state), state
 
-    seat, (total, say), h = asyncio.run(scenario([message(action="call")]))
-    check("model tool call -> total", total == h.legal_totals()[0] and say == "gl")
-    check("clean call not billed invalid", seat.invalid == 0)
+    player, (total, say), state = asyncio.run(scenario([message(action="call")]))
+    check("model tool call -> total", total == state["match"] and say == "gl")
+    check("clean call not billed invalid", player.invalid == 0)
 
-    seat, (total, _), h = asyncio.run(scenario([message(action="raise 3"), message(action="raise 6")]))
+    player, (total, _), state = asyncio.run(scenario([message(action="raise 3"), message(action="raise 6")]))
     check("illegal raise repaired by re-ask", total == 6)
-    check("repair not billed invalid", seat.invalid == 0)
+    check("repair not billed invalid", player.invalid == 0)
 
-    seat, (total, _), h = asyncio.run(scenario([message(content="I fold I guess"), message(content="hmm")]))
+    player, (total, _), state = asyncio.run(scenario([message(content="I fold I guess"), message(content="hmm")]))
     check("no tool call twice -> cheapest default", total is None)
-    check("failure billed invalid", seat.invalid == 1)
+    check("failure billed invalid", player.invalid == 1)
 
-    seat, (total, say), h = asyncio.run(
+    player, (total, say), state = asyncio.run(
         scenario([message(content='{"action": "call", "say": "leaked"}')])
     )
-    check("content-leaked JSON call repaired", total == h.legal_totals()[0] and say == "leaked")
+    check("content-leaked JSON call repaired", total == state["match"] and say == "leaked")
 
 
 if __name__ == "__main__":
@@ -251,8 +287,9 @@ if __name__ == "__main__":
     test_hand_rules()
     test_hand_fuzz()
     test_vocabulary()
-    test_dealer_session()
+    test_fish()
+    test_game_session()
     test_table_session()
-    test_seat_protocol()
-    test_model_seat_repair()
+    test_client_protocol()
+    test_model_player_repair()
     print("all game tests passed")
