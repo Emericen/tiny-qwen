@@ -8,8 +8,9 @@ Poker in two files: this module (the whole game) and table.html (the glass).
 Layers, top to bottom, with a hard rule — nothing below imports anything above:
 
     table.html   presentation: reads JSON, posts clicks; knows no Python
+    models.py    the other renderer: view -> prompt text, reply -> action
     bridge       (inside main) stdlib http.server: objects -> JSON, clicks -> step()
-    Table        one browser session: seats, pacing, narration
+    Table        the loop: assembles per-seat views, drives uniform Seats, paces
     Dealer       the game across hands: chips, button, score, the chat thread
     Hand         one episode: cards, betting, settlement — the rules
     scoring      pure math: 5 and 7 card evaluation
@@ -26,7 +27,6 @@ raise — real poker's incomplete-raise rule is dropped for legibility.
 import itertools
 import json
 import random
-import re
 import threading
 import time
 from collections import Counter
@@ -276,63 +276,6 @@ def action_to_total(hand: Hand, action: str) -> int | None:
     return int(action.split()[1])  # "raise N" — engine validates N
 
 
-ACTION_RE = re.compile(r"\b(fold|check|call|all-?in|raise\s+\d+|bet\s+\d+)\b", re.IGNORECASE)
-SAY_RE = re.compile(r"say:\s*(.+)", re.IGNORECASE)
-
-
-def parse_reply(text: str, hand: Hand) -> tuple[int | None, str, bool]:
-    """Free model text -> (commit_to, say, valid). The last action mentioned
-    wins; no valid action -> the cheapest legal thing (check if free, else
-    fold), reported as valid=False so harnesses can count it."""
-    seat = hand.acting_seat
-    match, escalation = hand.legal_totals()
-    say = ""
-    said = SAY_RE.search(text)
-    if said:
-        say = said.group(1).strip().strip('"')
-        text = text[: said.start()]
-    chosen, found = None, False
-    for hit in ACTION_RE.finditer(text):
-        word = re.sub(r"\s+", " ", hit.group(1).lower())
-        if word in ("check", "call"):
-            chosen, found = match, True
-        elif word in ("allin", "all-in"):
-            chosen, found = (escalation[-1] if escalation else match), True
-        elif word == "fold":
-            chosen, found = None, True
-        else:
-            n = int(word.split()[1])
-            if n in escalation:
-                chosen, found = n, True
-    if not found:
-        cost = match - hand.bets[seat]
-        chosen = None if cost > 0 else match
-    return chosen, say, found
-
-
-def observation(hand: Hand, seat: int, name: str, chat: list, talk: bool) -> str:
-    """What THIS player may know, as text. ASCII cards — the model's format."""
-    lines = []
-    kind = "Heads-up" if hand.player_count == 2 else f"{hand.player_count}-player"
-    lines.append(f"{kind} no-limit hold'em. Blinds {SMALL_BLIND}/{BIG_BLIND}. 1 bb = {BIG_BLIND} chips.")
-    lines.append(f"You are {name} (seat {seat}).")
-    lines.append(f"Your hole cards: {' '.join(card_ascii(c) for c in hand.holes[seat])}")
-    board = " ".join(card_ascii(c) for c in hand.revealed()) or "(none yet)"
-    lines.append(f"Street: {['preflop', 'flop', 'turn', 'river'][hand.street]}. Board: {board}")
-    lines.append(f"Pot: {sum(hand.bets)}. Your stack: {hand.stacks[seat]}.")
-    menu = labeled_legal(hand)
-    for entry in menu:
-        if entry["action"] == "call":
-            lines.append(f"To call: {entry['n']}.")
-    lines.append("Legal actions: " + ", ".join(entry["action"] for entry in menu))
-    lines.append("Reply with exactly one legal action from the list.")
-    if talk:
-        recent = [entry for entry in chat if entry["kind"] == "talk"][-8:]
-        if recent:
-            lines.append("Table talk so far:")
-            lines.extend(f'{entry["who"]}: {entry["text"]}' for entry in recent)
-        lines.append("You may add table talk on a second line: say: <message>")
-    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -341,11 +284,38 @@ def observation(hand: Hand, seat: int, name: str, chat: list, talk: bool) -> str
 
 FISH_STYLES = ("station", "nit", "maniac", "random")
 
-SYSTEM = (
-    "You are playing no-limit Texas hold'em for chips. "
-    "Read the state and reply with exactly one legal action copied from the list. "
-    "You may add one more line starting with 'say:' to talk to the table."
-)
+NOT_READY = object()  # a Seat's answer when it has none yet (the human is thinking)
+
+# The Seat protocol: act(view) -> (commit_to | None, say) | NOT_READY.
+# view is the dict Table assembles — a seat never touches Hand or Dealer.
+
+
+class HumanSeat:
+    """The browser wearing the Seat protocol: the bridge buffers the click,
+    act() answers NOT_READY until one lands."""
+
+    is_human = True
+
+    def __init__(self):
+        self.pending: str | None = None
+
+    def give(self, action: str):
+        self.pending = action
+
+    def act(self, view: dict):
+        if self.pending is None:
+            return NOT_READY
+        action, self.pending = self.pending.strip().lower(), None
+        if action == "fold":
+            return None, ""
+        if action in ("check", "call"):
+            return view["match"], ""
+        if action == "allin":
+            return (view["escalation"][1] if view["escalation"] else view["match"]), ""
+        try:
+            return int(action.split()[1]), ""  # "raise N" — the engine validates N
+        except (IndexError, ValueError):
+            return view["match"], ""
 
 
 class FishSeat:
@@ -355,11 +325,23 @@ class FishSeat:
         self.style = style
         self.rng = random.Random(seed)
 
-    def act(self, observation_text: str, hand: Hand) -> tuple[int | None, str]:
-        match, escalation = hand.legal_totals()
-        cost = match - hand.bets[hand.acting_seat]
+    def act(self, view: dict) -> tuple[int | None, str]:
+        match, cost, escalation = view["match"], view["cost"], view["escalation"]
         if self.style == "station":  # calls everything, never raises
             return match, ""
+        if self.style == "nit":  # folds to any bet, checks otherwise
+            return (None if cost > 0 else match), ""
+        if self.style == "maniac":  # escalates when it can, else calls
+            if escalation:
+                lo, hi = escalation
+                return self.rng.choice([lo, (lo + hi) // 2, hi]), ""
+            return match, ""
+        r = self.rng.random()  # "random"
+        if r < 0.1 and cost > 0:
+            return None, ""
+        if escalation and r < 0.5:
+            return self.rng.randint(*escalation), ""
+        return match, ""
         if self.style == "nit":  # folds to any bet, checks otherwise
             return (None if cost > 0 else match), ""
         if self.style == "maniac":  # escalates when it can, else calls
@@ -374,45 +356,19 @@ class FishSeat:
         return match, ""
 
 
-class ApiSeat:
-    """A seat driven by any OpenAI-compatible /chat/completions endpoint."""
-
-    def __init__(self, model: str, url: str, api_key: str = "", temperature: float = 1.0, max_tokens: int = 200):
-        self.model, self.url, self.api_key = model, url, api_key
-        self.temperature, self.max_tokens = temperature, max_tokens
-
-    def act(self, observation_text: str, hand: Hand) -> tuple[int | None, str]:
-        import urllib.request
-
-        body = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": SYSTEM},
-                {"role": "user", "content": observation_text},
-            ],
-            "max_tokens": self.max_tokens,
-            "temperature": self.temperature,
-        }
-        request = urllib.request.Request(
-            self.url.rstrip("/") + "/chat/completions",
-            data=json.dumps(body).encode(),
-            headers={"Content-Type": "application/json", "Authorization": f"Bearer {self.api_key}"},
-        )
-        with urllib.request.urlopen(request, timeout=240) as response:
-            reply = json.load(response)["choices"][0]["message"]["content"]
-        total, say, _ = parse_reply(reply, hand)
-        return total, say
 
 
-def make_seat(spec: str, key: str) -> tuple[object | None, str]:
-    """Seat spec -> (seat object or None for human, display name)."""
+def make_seat(spec: str, key: str) -> tuple[object, str]:
+    """Seat spec -> (seat, display name). main()'s wiring, not game logic."""
     if spec == "human":
-        return None, "you"
+        return HumanSeat(), "you"
     if spec.startswith("api:"):
+        from rl.poker.models import ModelSeat  # the model adapter stays out of the game
+
         model, _, url = spec[4:].rpartition("@")
         if not model or not url:
             raise SystemExit(f"bad api seat spec {spec!r}; use api:<model>@<base-url>")
-        return ApiSeat(model, url, key or ""), model.split("/")[-1]
+        return ModelSeat(model, url, key or ""), model.split("/")[-1]
     style = spec.removeprefix("fish:")
     if style not in FISH_STYLES:
         raise SystemExit(f"unknown seat spec {spec!r}; use human, {', '.join(FISH_STYLES)}, or api:<model>@<url>")
@@ -491,8 +447,8 @@ class Table:
     The game's pace belongs here: extra viewers' ticks are dropped."""
 
     def __init__(self, seats: list, names: list[str], chips: int = 200, seed: int = 0, talk: bool = True):
-        self.seats = seats  # physical order; None = the human
-        self.human = next((i for i, s in enumerate(seats) if s is None), None)
+        self.seats = seats  # physical order, Seat objects throughout
+        self.human = next((i for i, s in enumerate(seats) if getattr(s, "is_human", False)), None)
         self.watch = self.human is None
         self.talk = talk
         self.dealer = Dealer(names, chips, seed)
@@ -500,7 +456,7 @@ class Table:
         self.last_tick = 0.0
         self._base_key = None
         self.dealer.new_hand()
-        self._advance_ai()
+        self._advance()
 
     # -- driving the hand ----------------------------------------------------
 
@@ -538,20 +494,55 @@ class Table:
             how = "showdown"
         self.dealer.line(None, f"{self.dealer.names[winner]} wins {deltas[winner]} chips ({how}).", "deal")
 
-    def _advance_ai(self, limit: int = 50):
-        """Let AI seats act until it's the human's turn, the hand ends, or
-        (spectator view) one decision was made — so the page can animate."""
+    def _view(self, physical: int) -> dict:
+        """Assemble what the acting seat may know. Built only for the seat to
+        act — match/escalation/menu are that seat's numbers."""
+        hand = self.dealer.hand
+        seat = self.dealer.hand_seat(physical)
+        match, escalation = hand.legal_totals()
+        return {
+            "seat": seat,
+            "name": self.dealer.names[physical],
+            "player_count": hand.player_count,
+            "street": hand.street,
+            "board": hand.revealed(),
+            "hole": hand.holes[seat],
+            "stacks": hand.stacks,
+            "bets": hand.bets,
+            "pot": sum(hand.bets),
+            "price": max(hand.bets),
+            "match": match,
+            "cost": match - hand.bets[seat],
+            "escalation": [escalation.start, escalation[-1]] if escalation else None,
+            "menu": labeled_legal(hand),
+            "chat": [
+                {"who": e["who"], "text": e["text"]}
+                for e in self.dealer.chat
+                if e["kind"] == "talk"
+            ][-8:],
+            "talk": self.talk,
+        }
+
+    def _advance(self, limit: int = 50):
+        """The loop: view -> seat.act -> apply. Stops when the hand ends, a
+        seat isn't ready (the human is thinking), or — spectator view — one
+        decision was made, so the page can animate."""
         for _ in range(limit):
             hand = self.dealer.hand
             if hand.acting_seat is None:
                 return
             physical = self.dealer.physical(hand.acting_seat)
             seat = self.seats[physical]
-            if seat is None:
+            result = seat.act(self._view(physical))
+            if result is NOT_READY:
                 return
-            obs = observation(hand, hand.acting_seat, self.dealer.names[physical], self.dealer.chat, self.talk)
-            total, say = seat.act(obs, hand)
-            self._apply(physical, total, say)
+            total, say = result
+            try:
+                self._apply(physical, total, say)
+            except ValueError:
+                if getattr(seat, "is_human", False):
+                    return  # stale click; the page will re-fetch the menu
+                raise
             if self.watch:
                 return
 
@@ -560,15 +551,12 @@ class Table:
     def act(self, action: str):
         with self.lock:
             hand = self.dealer.hand
-            if hand.acting_seat is None or self.human is None:
+            if self.human is None or hand.acting_seat is None:
                 return
             if self.dealer.physical(hand.acting_seat) != self.human:
                 return
-            try:
-                self._apply(self.human, action_to_total(hand, action), "")
-            except ValueError:
-                return  # stale or illegal request; the page will re-fetch the menu
-            self._advance_ai()
+            self.seats[self.human].give(action)
+            self._advance()
 
     def post_chat(self, text: str):
         with self.lock:
@@ -582,13 +570,13 @@ class Table:
                 return
             self.last_tick = now
             if self.dealer.hand.acting_seat is not None:
-                self._advance_ai()
+                self._advance()
 
     def next_hand(self):
         with self.lock:
             if self.dealer.hand.acting_seat is None:
                 self.dealer.new_hand()
-                self._advance_ai()
+                self._advance()
 
     # -- the JSON contract table.html speaks ----------------------------------
 
@@ -657,7 +645,7 @@ def main():
 
     seat0, name0 = make_seat(args.p0, args.key0)
     seat1, name1 = make_seat(args.p1, args.key1)
-    if seat0 is None and seat1 is None:
+    if all(getattr(seat, "is_human", False) for seat in (seat0, seat1)):
         raise SystemExit("two human seats need two browsers and a notion of identity — not built; keep one human")
 
     table = Table([seat0, seat1], [name0, name1], chips=args.chips, seed=args.seed, talk=not args.no_talk)

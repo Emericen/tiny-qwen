@@ -10,15 +10,17 @@ from rl.poker.game import (
     Dealer,
     FishSeat,
     Hand,
+    HumanSeat,
     INT_TO_CARD,
+    NOT_READY,
     Table,
     action_to_total,
     card_ascii,
     get_5_score,
     get_7_score,
     labeled_legal,
-    parse_reply,
 )
+from rl.poker.models import parse_reply, render_prompt
 
 
 def check(name, condition, detail=""):
@@ -115,12 +117,15 @@ def test_vocabulary():
         total = action_to_total(h, entry["action"])
         legal = total is None or total == h.legal_totals()[0] or total in h.legal_totals()[1]
         check(f"menu action {entry['action']!r} round-trips", legal)
-    check("parse: last action wins", parse_reply("I could fold but raise 6", h)[0] == 6)
-    check("parse reports validity", parse_reply("call", h)[2] and not parse_reply("hmm", h)[2])
-    check("parse: call", parse_reply("call", h)[0] == h.legal_totals()[0])
-    check("parse: allin", parse_reply("allin!", h)[0] == h.legal_totals()[1][-1])
-    check("parse: say extracted", parse_reply("call\nsay: nice hand", h)[:2] == (h.legal_totals()[0], "nice hand"))
-    check("parse: garbage folds facing a bet", parse_reply("hmm", h)[0] is None)
+    m, esc = h.legal_totals()
+    cost = m - h.bets[h.acting_seat]
+    check("parse: last action wins", parse_reply("I could fold but raise 6", m, esc, cost)[0] == 6)
+    check("parse reports validity", parse_reply("call", m, esc, cost)[2] and not parse_reply("hmm", m, esc, cost)[2])
+    check("parse: call", parse_reply("call", m, esc, cost)[0] == m)
+    check("parse: allin", parse_reply("allin!", m, esc, cost)[0] == esc[-1])
+    check("parse: pair form of escalation", parse_reply("raise 6", m, [esc.start, esc[-1]], cost)[0] == 6)
+    check("parse: say extracted", parse_reply("call\nsay: nice hand", m, esc, cost)[:2] == (m, "nice hand"))
+    check("parse: garbage folds facing a bet", parse_reply("hmm", m, esc, cost)[0] is None)
 
 
 def test_dealer_session():
@@ -159,6 +164,25 @@ def test_table_session():
     check("spectator sees both holes", all(cards != ["?", "?"] for cards in state["hole"]))
 
 
+def test_seat_protocol():
+    table = Table([HumanSeat(), FishSeat("station", 2)], ["you", "s"], chips=200, seed=11)
+    check("loop pauses on the human (NOT_READY)", table.state()["your_turn"])
+    view = table._view(0)
+    for field in ("seat", "hole", "board", "match", "cost", "escalation", "menu", "chat", "talk"):
+        check(f"view has {field!r}", field in view)
+    prompt = render_prompt(view)
+    check("prompt shows ascii hole cards", "Your hole cards: " in prompt and "♥" not in prompt)
+    check("prompt lists the menu", "Legal actions: " in prompt)
+    table.act("call")
+    check("human call advances into the hand", table.dealer.hand.street >= 0 and table.state()["your_turn"])
+    table.act("raise 4")
+    state = table.state()
+    check("human raise applied, station answered", sum(table.dealer.hand.bets) >= 8, str(table.dealer.hand.bets))
+    table.act("fold")
+    check("human fold ends the hand", table.dealer.hand.acting_seat is None)
+    check("seat protocol NOT_READY sentinel exported", NOT_READY is not None)
+
+
 if __name__ == "__main__":
     test_cards()
     test_scoring()
@@ -167,4 +191,5 @@ if __name__ == "__main__":
     test_vocabulary()
     test_dealer_session()
     test_table_session()
+    test_seat_protocol()
     print("all game tests passed")
