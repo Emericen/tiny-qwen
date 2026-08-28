@@ -1,19 +1,16 @@
 """
-Poker in two files: this module (the whole game) and table.html (the glass).
+Poker in four nouns:
 
-    python -m rl.game                                    # you vs a calling station
-    python -m rl.game --p0 maniac --p1 nit               # spectate two fish
-    python -m rl.game --p1 api:grok-4.5@https://api.x.ai/v1 --key1 $XAI_API_KEY
+    game.py      THE GAME:    state per the rules — pure library, no entry point
+    seat.py      THE PLAYERS: one Seat class (human, fish, model) answering views
+    server.py    THE DOOR:    FastAPI + SSE — streams views out, takes actions in
+    table.html   THE GLASS:   renders what the door streams
 
-Layers, top to bottom, with a hard rule — nothing below imports anything above:
-
-    table.html   presentation: reads JSON, posts clicks; knows no Python
-    models.py    the other renderer: view -> prompt text, reply -> action
-    bridge       (inside main) stdlib http.server: objects -> JSON, clicks -> step()
-    Table        the loop: assembles per-seat views, drives uniform Seats, paces
-    Dealer       the game across hands: chips, button, score, the chat thread
-    Hand         one episode: cards, betting, settlement — the rules
-    scoring      pure math: 5 and 7 card evaluation
+This file is data structures per the game's rules and nothing else: cards and
+scoring, one Hand (an episode), the Dealer (the game across hands: chips,
+button, score, chat), and the Table — the async loop that assembles per-seat
+views, awaits whoever's turn it is, and notifies subscribers on every event.
+It imports nothing above it and knows nothing of HTTP, models, or pixels.
 
 The engine speaks ONE action: your cumulative chip total for the hand
 (None = fold). check / call / bet / raise / all-in are presentation-layer
@@ -24,13 +21,10 @@ DEVIATION (documented): every all-in re-opens the action, even below a full
 raise — real poker's incomplete-raise rule is dropped for legibility.
 """
 
+import asyncio
 import itertools
-import json
 import random
-import threading
-import time
 from collections import Counter
-from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # the deck
@@ -231,13 +225,13 @@ class Hand:
 
 
 # ---------------------------------------------------------------------------
-# presentation vocabulary: numbers -> poker words (and back)
+# vocabulary: the acting seat's menu in poker words
 # ---------------------------------------------------------------------------
 
 
 def labeled_legal(hand: Hand) -> list[dict]:
-    """The acting seat's menu as poker words. Used by the browser buttons AND
-    by model observations, so both speak the same vocabulary."""
+    """The acting seat's menu as poker words. The browser buttons and the
+    model prompt both consume this, so the two can never disagree."""
     seat = hand.acting_seat
     match, escalation = hand.legal_totals()
     cost = match - hand.bets[seat]
@@ -263,129 +257,15 @@ def labeled_legal(hand: Hand) -> list[dict]:
     return menu
 
 
-def action_to_total(hand: Hand, action: str) -> int | None:
-    """A menu action string -> the commit_to number the engine speaks."""
-    match, escalation = hand.legal_totals()
-    action = action.strip().lower()
-    if action == "fold":
-        return None
-    if action in ("check", "call"):
-        return match
-    if action == "allin":
-        return escalation[-1] if escalation else match
-    return int(action.split()[1])  # "raise N" — engine validates N
-
-
-
-
-# ---------------------------------------------------------------------------
-# seats: things that turn an observation into an action
-# ---------------------------------------------------------------------------
-
-FISH_STYLES = ("station", "nit", "maniac", "random")
-
-NOT_READY = object()  # a Seat's answer when it has none yet (the human is thinking)
-
-# The Seat protocol: act(view) -> (commit_to | None, say) | NOT_READY.
-# view is the dict Table assembles — a seat never touches Hand or Dealer.
-
-
-class HumanSeat:
-    """The browser wearing the Seat protocol: the bridge buffers the click,
-    act() answers NOT_READY until one lands."""
-
-    is_human = True
-
-    def __init__(self):
-        self.pending: str | None = None
-
-    def give(self, action: str):
-        self.pending = action
-
-    def act(self, view: dict):
-        if self.pending is None:
-            return NOT_READY
-        action, self.pending = self.pending.strip().lower(), None
-        if action == "fold":
-            return None, ""
-        if action in ("check", "call"):
-            return view["match"], ""
-        if action == "allin":
-            return (view["escalation"][1] if view["escalation"] else view["match"]), ""
-        try:
-            return int(action.split()[1]), ""  # "raise N" — the engine validates N
-        except (IndexError, ValueError):
-            return view["match"], ""
-
-
-class FishSeat:
-    """Scripted opponents. Exploitable on purpose; they are the beta meter."""
-
-    def __init__(self, style: str = "station", seed: int = 0):
-        self.style = style
-        self.rng = random.Random(seed)
-
-    def act(self, view: dict) -> tuple[int | None, str]:
-        match, cost, escalation = view["match"], view["cost"], view["escalation"]
-        if self.style == "station":  # calls everything, never raises
-            return match, ""
-        if self.style == "nit":  # folds to any bet, checks otherwise
-            return (None if cost > 0 else match), ""
-        if self.style == "maniac":  # escalates when it can, else calls
-            if escalation:
-                lo, hi = escalation
-                return self.rng.choice([lo, (lo + hi) // 2, hi]), ""
-            return match, ""
-        r = self.rng.random()  # "random"
-        if r < 0.1 and cost > 0:
-            return None, ""
-        if escalation and r < 0.5:
-            return self.rng.randint(*escalation), ""
-        return match, ""
-        if self.style == "nit":  # folds to any bet, checks otherwise
-            return (None if cost > 0 else match), ""
-        if self.style == "maniac":  # escalates when it can, else calls
-            if escalation:
-                return self.rng.choice([escalation.start, escalation[len(escalation) // 2], escalation[-1]]), ""
-            return match, ""
-        r = self.rng.random()  # "random"
-        if r < 0.1 and cost > 0:
-            return None, ""
-        if escalation and r < 0.5:
-            return self.rng.choice(list(escalation)), ""
-        return match, ""
-
-
-
-
-def make_seat(spec: str, key: str) -> tuple[object, str]:
-    """Seat spec -> (seat, display name). main()'s wiring, not game logic."""
-    if spec == "human":
-        return HumanSeat(), "you"
-    if spec.startswith("api:"):
-        from rl.poker.models import ModelSeat  # the model adapter stays out of the game
-
-        model, _, url = spec[4:].rpartition("@")
-        if not model or not url:
-            raise SystemExit(f"bad api seat spec {spec!r}; use api:<model>@<base-url>")
-        return ModelSeat(model, url, key or ""), model.split("/")[-1]
-    style = spec.removeprefix("fish:")
-    if style not in FISH_STYLES:
-        raise SystemExit(f"unknown seat spec {spec!r}; use human, {', '.join(FISH_STYLES)}, or api:<model>@<url>")
-    import zlib
-
-    return FishSeat(style, seed=zlib.crc32(spec.encode()) % 1000), f"fish ({style})"
-
-
 # ---------------------------------------------------------------------------
 # Dealer: the game across hands — chips, button, score, and the chat thread
 # ---------------------------------------------------------------------------
 
 
 class Dealer:
-    """Runs the game: owns the chips, rotates the button (by seat-flipping,
-    two players), keeps the running score, and holds the chat thread — the
-    append-only ground truth every view (browser, observation, log) slices."""
+    """Owns the chips, rotates the button (by seat-flipping, two players),
+    keeps the running score, and holds the chat thread — the append-only
+    ground truth every view (browser, prompt, log) slices."""
 
     def __init__(self, names: list[str], chips: int = 200, seed: int = 0):
         self.names = names
@@ -438,38 +318,105 @@ class Dealer:
 
 
 # ---------------------------------------------------------------------------
-# Table: one browser session — seats, pacing, narration. No web imports.
+# Table: the loop — views out, answers in, subscribers notified. Async, pure.
 # ---------------------------------------------------------------------------
 
 
 class Table:
-    """Glues seats to a Dealer and narrates the game into the chat thread.
-    The game's pace belongs here: extra viewers' ticks are dropped."""
+    """Assembles per-seat views, awaits whoever's turn it is (the Seat
+    protocol: await act(view) -> (commit_to, say)), applies answers, narrates
+    into the chat thread, and pings subscriber queues on every event. The
+    game's clock lives here — the display just watches."""
 
-    def __init__(self, seats: list, names: list[str], chips: int = 200, seed: int = 0, talk: bool = True):
-        self.seats = seats  # physical order, Seat objects throughout
+    def __init__(self, seats: list, names: list[str] | None = None, chips: int = 200,
+                 seed: int = 0, talk: bool = True, pace: float = 0.8):
+        self.seats = seats  # physical order; protocol objects (see seat.py)
+        names = names or [getattr(s, "name", f"seat {i}") for i, s in enumerate(seats)]
         self.human = next((i for i, s in enumerate(seats) if getattr(s, "is_human", False)), None)
         self.watch = self.human is None
         self.talk = talk
+        self.pace = pace
         self.dealer = Dealer(names, chips, seed)
-        self.lock = threading.Lock()
-        self.last_tick = 0.0
+        self.subscribers: set[asyncio.Queue] = set()
+        self._new_request = asyncio.Event()
         self._base_key = None
         self.dealer.new_hand()
-        self._advance()
+
+    # -- subscriptions (the door hangs its streams here) ---------------------
+
+    def subscribe(self) -> asyncio.Queue:
+        queue = asyncio.Queue()
+        self.subscribers.add(queue)
+        return queue
+
+    def unsubscribe(self, queue: asyncio.Queue):
+        self.subscribers.discard(queue)
+
+    def _notify(self):
+        for queue in list(self.subscribers):
+            queue.put_nowait(True)
+
+    # -- inputs from the door ------------------------------------------------
+
+    def give(self, action: str):
+        """Route the human's click to their seat — only when it's their turn."""
+        hand = self.dealer.hand
+        if self.human is None or hand.acting_seat is None:
+            return
+        if self.dealer.physical(hand.acting_seat) == self.human:
+            self.seats[self.human].give(action)
+
+    def post_chat(self, text: str):
+        if self.human is not None and text.strip():
+            self.dealer.say(self.human, text.strip())
+            self._notify()
+
+    def request_new(self):
+        self._new_request.set()
+
+    # -- the clock -----------------------------------------------------------
+
+    async def run(self):
+        """The game runs itself; viewers merely render what they're told."""
+        self._notify()
+        while True:
+            hand = self.dealer.hand
+            if hand.acting_seat is None:  # hand over: deal the next one
+                if self.watch:
+                    await asyncio.sleep(self.pace * 3)
+                else:
+                    await self._new_request.wait()
+                    self._new_request.clear()
+                self.dealer.new_hand()
+                self._notify()
+                continue
+            physical = self.dealer.physical(hand.acting_seat)
+            seat = self.seats[physical]
+            total, say = await seat.act(self._view(physical))
+            try:
+                self._apply(physical, total, say)
+            except ValueError:
+                if getattr(seat, "is_human", False):
+                    continue  # stale or garbage click; re-await a fresh one
+                raise
+            self._notify()
+            if not getattr(seat, "is_human", False) and self.pace:
+                await asyncio.sleep(self.pace)
 
     # -- driving the hand ----------------------------------------------------
 
     def _apply(self, physical: int, total: int | None, say: str):
         hand = self.dealer.hand
+        match, escalation = hand.legal_totals()
+        cost = match - hand.bets[hand.acting_seat]
         if total is None:  # narrate with the word the number means
             word = "fold"
+        elif total == match:
+            word = "call" if cost > 0 else "check"
+        elif escalation and total == escalation[-1]:
+            word = "allin"
         else:
-            word = next(
-                (e["action"] for e in labeled_legal(hand)
-                 if e["action"] != "fold" and action_to_total(hand, e["action"]) == total),
-                f"raise {total}",
-            )
+            word = f"raise {total}"
         street_before = hand.street
         hand.step(total)
         if self.talk and say:
@@ -494,9 +441,11 @@ class Table:
             how = "showdown"
         self.dealer.line(None, f"{self.dealer.names[winner]} wins {deltas[winner]} chips ({how}).", "deal")
 
+    # -- views ---------------------------------------------------------------
+
     def _view(self, physical: int) -> dict:
-        """Assemble what the acting seat may know. Built only for the seat to
-        act — match/escalation/menu are that seat's numbers."""
+        """What the acting seat may know. Built only for the seat to act —
+        match/escalation/menu are that seat's numbers."""
         hand = self.dealer.hand
         seat = self.dealer.hand_seat(physical)
         match, escalation = hand.legal_totals()
@@ -523,62 +472,7 @@ class Table:
             "talk": self.talk,
         }
 
-    def _advance(self, limit: int = 50):
-        """The loop: view -> seat.act -> apply. Stops when the hand ends, a
-        seat isn't ready (the human is thinking), or — spectator view — one
-        decision was made, so the page can animate."""
-        for _ in range(limit):
-            hand = self.dealer.hand
-            if hand.acting_seat is None:
-                return
-            physical = self.dealer.physical(hand.acting_seat)
-            seat = self.seats[physical]
-            result = seat.act(self._view(physical))
-            if result is NOT_READY:
-                return
-            total, say = result
-            try:
-                self._apply(physical, total, say)
-            except ValueError:
-                if getattr(seat, "is_human", False):
-                    return  # stale click; the page will re-fetch the menu
-                raise
-            if self.watch:
-                return
-
-    # -- the four things a browser can do -------------------------------------
-
-    def act(self, action: str):
-        with self.lock:
-            hand = self.dealer.hand
-            if self.human is None or hand.acting_seat is None:
-                return
-            if self.dealer.physical(hand.acting_seat) != self.human:
-                return
-            self.seats[self.human].give(action)
-            self._advance()
-
-    def post_chat(self, text: str):
-        with self.lock:
-            if self.human is not None and text.strip():
-                self.dealer.say(self.human, text.strip())
-
-    def tick(self):
-        with self.lock:
-            now = time.monotonic()
-            if now - self.last_tick < 0.8:
-                return
-            self.last_tick = now
-            if self.dealer.hand.acting_seat is not None:
-                self._advance()
-
-    def next_hand(self):
-        with self.lock:
-            if self.dealer.hand.acting_seat is None:
-                self.dealer.new_hand()
-                self._advance()
-
-    # -- the JSON contract table.html speaks ----------------------------------
+    # -- the JSON contract table.html speaks ---------------------------------
 
     def _street_base(self) -> list[int]:
         """bets snapshot at street start, for drawing carried-pot vs live bets."""
@@ -589,112 +483,34 @@ class Table:
             self._base = hand.bets.copy()
         return self._base
 
-    def state(self) -> dict:
-        with self.lock:
-            dealer, hand = self.dealer, self.dealer.hand
-            done = hand.acting_seat is None
-            base = [0] * 2 if done else self._street_base()
-            show = [self.watch or done or physical == self.human for physical in (0, 1)]
-            acting_physical = None if done else dealer.physical(hand.acting_seat)
-            your_turn = self.human is not None and acting_physical == self.human
-            return {
-                "hand_no": dealer.hand_no,
-                "watch": self.watch,
-                "human": self.human,
-                "names": dealer.names,
-                "board": [card_ascii(c) for c in hand.revealed()],
-                "pot": sum(base),  # carried pot only — live bets are drawn at the seats
-                "stacks": [hand.stacks[dealer.hand_seat(p)] for p in (0, 1)],
-                "bets": [hand.bets[dealer.hand_seat(p)] - base[dealer.hand_seat(p)] for p in (0, 1)],
-                "hole": [
-                    [card_ascii(c) for c in hand.holes[dealer.hand_seat(p)]] if show[p] else ["?", "?"]
-                    for p in (0, 1)
-                ],
-                "button": dealer.flip,
-                "to_act": acting_physical,
-                "your_turn": your_turn,
-                "legal": labeled_legal(hand) if your_turn else [],
-                "done": done,
-                "totals_bb": [round(t, 1) for t in dealer.totals],
-                "chat": [{"who": e["who"], "text": e["text"], "kind": e["kind"]} for e in dealer.chat[-60:]],
-                "talk": self.talk,
-            }
-
-
-# ---------------------------------------------------------------------------
-# the bridge: everything below is plumbing — no poker. stdlib only.
-# ---------------------------------------------------------------------------
-
-
-def main():
-    import argparse
-    import webbrowser
-    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-
-    parser = argparse.ArgumentParser(description="a poker table in the browser; any mix of players")
-    parser.add_argument("--p0", default="human", help="seat 0: human, a fish style, or api:<model>@<url>")
-    parser.add_argument("--p1", default="station", help="seat 1: same choices")
-    parser.add_argument("--key0", default="", help="api key for seat 0 (api seats only)")
-    parser.add_argument("--key1", default="", help="api key for seat 1")
-    parser.add_argument("--chips", type=int, default=200)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--no-talk", action="store_true")
-    parser.add_argument("--no-open", action="store_true", help="don't auto-open the browser")
-    parser.add_argument("--port", type=int, default=8642)
-    args = parser.parse_args()
-
-    seat0, name0 = make_seat(args.p0, args.key0)
-    seat1, name1 = make_seat(args.p1, args.key1)
-    if all(getattr(seat, "is_human", False) for seat in (seat0, seat1)):
-        raise SystemExit("two human seats need two browsers and a notion of identity — not built; keep one human")
-
-    table = Table([seat0, seat1], [name0, name1], chips=args.chips, seed=args.seed, talk=not args.no_talk)
-    page = Path(__file__).with_name("table.html")
-
-    class Handler(BaseHTTPRequestHandler):
-        def log_message(self, *_):
-            pass
-
-        def _json(self, payload: dict):
-            body = json.dumps(payload).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def do_GET(self):
-            if self.path == "/state":
-                return self._json(table.state())
-            body = page.read_bytes()  # read per request, so editing table.html only needs a refresh
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def do_POST(self):
-            length = int(self.headers.get("Content-Length", 0))
-            payload = json.loads(self.rfile.read(length) or b"{}") if length else {}
-            if self.path == "/act":
-                table.act(str(payload.get("action", "")))
-            elif self.path == "/chat":
-                table.post_chat(str(payload.get("text", "")))
-            elif self.path == "/new":
-                table.next_hand()
-            elif self.path == "/tick":
-                table.tick()
-            self._json({"ok": True})
-
-    url = f"http://localhost:{args.port}"
-    print(f"table open at {url}  (ctrl-c to quit)")
-    if not args.no_open:
-        webbrowser.open(url)
-    try:
-        ThreadingHTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
-    except KeyboardInterrupt:
-        pass
-
-
-if __name__ == "__main__":
-    main()
+    def state(self, for_seat: int | None) -> dict:
+        """One subscriber's snapshot. for_seat None = spectator (v1: sees all
+        holes); a seat number sees its own cards until showdown."""
+        dealer, hand = self.dealer, self.dealer.hand
+        done = hand.acting_seat is None
+        base = [0] * 2 if done else self._street_base()
+        show = [for_seat is None or done or physical == for_seat for physical in (0, 1)]
+        acting_physical = None if done else dealer.physical(hand.acting_seat)
+        your_turn = for_seat is not None and acting_physical == for_seat
+        return {
+            "hand_no": dealer.hand_no,
+            "watch": for_seat is None,
+            "human": for_seat,
+            "names": dealer.names,
+            "board": [card_ascii(c) for c in hand.revealed()],
+            "pot": sum(base),  # carried pot only — live bets are drawn at the seats
+            "stacks": [hand.stacks[dealer.hand_seat(p)] for p in (0, 1)],
+            "bets": [hand.bets[dealer.hand_seat(p)] - base[dealer.hand_seat(p)] for p in (0, 1)],
+            "hole": [
+                [card_ascii(c) for c in hand.holes[dealer.hand_seat(p)]] if show[p] else ["?", "?"]
+                for p in (0, 1)
+            ],
+            "button": dealer.flip,
+            "to_act": acting_physical,
+            "your_turn": your_turn,
+            "legal": labeled_legal(hand) if your_turn else [],
+            "done": done,
+            "totals_bb": [round(t, 1) for t in dealer.totals],
+            "chat": [{"who": e["who"], "text": e["text"], "kind": e["kind"]} for e in dealer.chat[-60:]],
+            "talk": self.talk,
+        }
