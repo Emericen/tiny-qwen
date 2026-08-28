@@ -96,9 +96,11 @@ class Hand:
     """one episode, ANY number of players. An action is ONE number: your
     cumulative chip total for the hand. None = fold. bets[] is each player's
     total investment; the pot is its sum; side pots are layers of it. A street
-    ends when everyone still able to act has answered the current price."""
+    ends when everyone still able to act has answered the current price.
+    Seats are table order; `button` is just an index — where the blinds are
+    posted and where each street's turn order starts."""
 
-    def __init__(self, stacks: list[int], seed: int | None = None):
+    def __init__(self, stacks: list[int], button: int = 0, seed: int | None = None):
         self.player_count = len(stacks)
         self.board, self.holes = self._deal(self.player_count, seed)
         self.stacks = stacks.copy()
@@ -106,7 +108,12 @@ class Hand:
         self.folded = [False] * self.player_count
         self.min_raise = BIG_BLIND
         self.street = 0
-        small_blind_seat, big_blind_seat = (0, 1) if self.player_count == 2 else (1, 2)
+        self.button = button
+        if self.player_count == 2:  # heads-up: the button posts the small blind
+            small_blind_seat, big_blind_seat = button, (button + 1) % 2
+        else:
+            small_blind_seat = (button + 1) % self.player_count
+            big_blind_seat = (button + 2) % self.player_count
         self._commit(small_blind_seat, SMALL_BLIND)
         self._commit(big_blind_seat, BIG_BLIND)
         self.answers_owed = sum(not self.is_all_in(seat) for seat in range(self.player_count))
@@ -193,7 +200,7 @@ class Hand:
         self.street += 1
         self.min_raise = BIG_BLIND
         self.answers_owed = able_to_act
-        self.acting_seat = self._next_able_seat(0)  # first able seat after the button
+        self.acting_seat = self._next_able_seat(self.button)  # first able seat after the button
 
     def _settle(self):
         """award the pot in layers — each layer capped by its shortest investor"""
@@ -285,11 +292,11 @@ class Game:
         self.pause = pause  # seconds a finished hand stays up when auto-dealing
         self.chips = chips
         self.seed = seed
-        self.stacks = [chips] * self.n  # physical player order, stable across hands
-        self.totals = [0.0] * self.n  # score in bb, physical order
-        self.chat = []  # {"seat": physical | None, "who", "text", "kind"}
+        self.stacks = [chips] * self.n
+        self.totals = [0.0] * self.n  # score in bb
+        self.chat = []  # {"seat": int | None (dealer), "who", "text", "kind"}
         self.hand_no = 0
-        self.button = 0  # physical index holding the button this hand
+        self.button = 0  # rotates every hand; Hand derives blinds and turn order from it
         self.hand: Hand | None = None
         self.version = 0
         self._changed = asyncio.Condition()
@@ -309,14 +316,6 @@ class Game:
         if text:
             self.line(seat, text, "talk")
 
-    # -- seat geometry: hand seat 0 is always the button ---------------------
-
-    def physical(self, hand_seat: int) -> int:
-        return (self.button + hand_seat) % self.n
-
-    def hand_seat(self, physical: int) -> int:
-        return (physical - self.button) % self.n
-
     # -- hands ---------------------------------------------------------------
 
     def new_hand(self) -> Hand:
@@ -326,7 +325,7 @@ class Game:
             self.stacks = [s if s > 0 else self.chips for s in self.stacks]
             self.line(None, "— rebuy: fresh stacks —", "deal")
         self._before = self.stacks.copy()
-        self.hand = Hand([self.stacks[self.physical(s)] for s in range(self.n)], seed=self.seed + self.hand_no)
+        self.hand = Hand(self.stacks, button=self.button, seed=self.seed + self.hand_no)
         self.line(None, f"— hand {self.hand_no} —", "deal")
         if self.hand_no > 1:
             score = " · ".join(f"{self.names[i]} {self.totals[i]:+.1f} bb" for i in range(self.n))
@@ -335,8 +334,7 @@ class Game:
 
     def collect(self) -> list[int]:
         """Fold the finished hand back into the table; returns chip deltas."""
-        for hand_seat in range(self.n):
-            self.stacks[self.physical(hand_seat)] = self.hand.stacks[hand_seat]
+        self.stacks = self.hand.stacks.copy()
         deltas = [self.stacks[i] - self._before[i] for i in range(self.n)]
         for i in range(self.n):
             self.totals[i] += deltas[i] / BIG_BLIND
@@ -360,9 +358,7 @@ class Game:
     def give(self, seat: int, total: int | None):
         """An action arrives for `seat`. Accepted only when it is that seat's
         turn — anything else is a stale or confused client and is dropped."""
-        if self.hand.acting_seat is None:
-            return
-        if self.physical(self.hand.acting_seat) == seat:
+        if self.hand.acting_seat == seat:
             self._actions.put_nowait((seat, total))
 
     async def post_chat(self, seat: int, text: str):
@@ -391,7 +387,7 @@ class Game:
                 await self._notify()
                 continue
             seat, total = await self._actions.get()
-            if seat != self.physical(hand.acting_seat):
+            if seat != hand.acting_seat:
                 continue  # queued before the turn moved on
             try:
                 self._apply(seat, total)
@@ -399,7 +395,7 @@ class Game:
                 continue  # an illegal number from a stale view; keep waiting
             await self._notify()
 
-    def _apply(self, physical: int, total: int | None):
+    def _apply(self, seat: int, total: int | None):
         hand = self.hand
         match, escalation = hand.legal_totals()
         cost = match - hand.bets[hand.acting_seat]
@@ -413,7 +409,7 @@ class Game:
             word = f"raise {total}"
         street_before = hand.street
         hand.step(total)
-        self.line(physical, word, "act")
+        self.line(seat, word, "act")
         if hand.acting_seat is not None and hand.street > street_before:
             self.line(None, f"{STREETS[hand.street]}: {' '.join(hand.revealed())}", "deal")
         if hand.acting_seat is None:
@@ -446,8 +442,7 @@ class Game:
         done = hand.acting_seat is None
         base = [0] * self.n if done else self._street_base()
         show = [for_seat is None or done or p == for_seat for p in range(self.n)]
-        acting_physical = None if done else self.physical(hand.acting_seat)
-        your_turn = for_seat is not None and acting_physical == for_seat
+        your_turn = for_seat is not None and hand.acting_seat == for_seat
         match, escalation = hand.legal_totals() if your_turn else (None, range(0))
         return {
             "hand_no": self.hand_no,
@@ -458,14 +453,14 @@ class Game:
             "street": hand.street,
             "board": [card_ascii(c) for c in hand.revealed()],
             "pot": sum(base),  # carried pot only — live bets are drawn at the seats
-            "stacks": [hand.stacks[self.hand_seat(p)] for p in range(self.n)],
-            "bets": [hand.bets[self.hand_seat(p)] - base[self.hand_seat(p)] for p in range(self.n)],
+            "stacks": list(hand.stacks),
+            "bets": [hand.bets[p] - base[p] for p in range(self.n)],
             "hole": [
-                [card_ascii(c) for c in hand.holes[self.hand_seat(p)]] if show[p] else ["?", "?"]
+                [card_ascii(c) for c in hand.holes[p]] if show[p] else ["?", "?"]
                 for p in range(self.n)
             ],
             "button": self.button,
-            "to_act": acting_physical,
+            "to_act": hand.acting_seat,
             "your_turn": your_turn,
             "match": match,
             "escalation": [escalation.start, escalation[-1]] if escalation else None,

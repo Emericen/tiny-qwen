@@ -30,7 +30,7 @@ def check(name, condition, detail=""):
 
 def acting_state(game: Game) -> dict:
     """The snapshot the acting seat's client would receive."""
-    return game.state(game.physical(game.hand.acting_seat))
+    return game.state(game.hand.acting_seat)
 
 
 def test_cards():
@@ -90,6 +90,15 @@ def test_hand_rules():
     h.step(h.legal_totals()[0])
     check("street advances after option", h.street == 1)
 
+    h = Hand([200, 200], button=1, seed=4)
+    check("HU button=1: seat 1 posts small and opens", h.bets == [2, 1] and h.acting_seat == 1)
+
+    h = Hand([100, 100, 100], button=1, seed=2)
+    check("3-way button=1: blinds at 2 and 0, button opens", h.bets == [2, 0, 1] and h.acting_seat == 1)
+    h.step(None)
+    h.step(None)
+    check("blinds fold -> BB scoops (rotated)", h.stacks == [101, 100, 99], str(h.stacks))
+
 
 def test_hand_fuzz():
     rng = random.Random(0)
@@ -97,7 +106,7 @@ def test_hand_fuzz():
         n = rng.randint(2, 6)
         stacks = [rng.randint(2, 300) for _ in range(n)]
         total0 = sum(stacks)
-        h = Hand(stacks, seed=trial)
+        h = Hand(stacks, button=rng.randrange(n), seed=trial)
         steps = 0
         while h.acting_seat is not None:
             match, esc = h.legal_totals()
@@ -109,7 +118,7 @@ def test_hand_fuzz():
                 assert sum(h.stacks) + sum(h.bets) == total0, "conservation mid-hand"
         assert sum(h.stacks) == total0, "conservation at settle"
         assert min(h.stacks) >= 0
-    check("fuzz: 20,000 hands (2-6 players) conserve money and terminate", True)
+    check("fuzz: 20,000 hands (2-6 players, all buttons) conserve money and terminate", True)
 
 
 def test_vocabulary():
@@ -154,13 +163,13 @@ def test_fish():
 
 def test_game_session():
     g = Game(["a", "b"], chips=200, seed=7)
-    check("hand 1: physical 0 has the button", g.button == 0 and g.physical(0) == 0)
+    check("hand 1: seat 0 has the button", g.button == 0 and g.hand.button == 0)
     while g.hand.acting_seat is not None:
         g.hand.step(g.hand.legal_totals()[0])
     g.collect()
     check("chips conserved through collect", sum(g.stacks) == 400, str(g.stacks))
     g.new_hand()
-    check("hand 2: button rotated", g.button == 1 and g.physical(0) == 1)
+    check("hand 2: button rotated, blinds moved", g.button == 1 and g.hand.bets[1] == 1)
     g.say(0, "hello")
     check("chat is ground truth on the game", g.chat[-1]["who"] == "a" and g.chat[-1]["kind"] == "talk")
     g.stacks = [400, 0]
@@ -168,13 +177,12 @@ def test_game_session():
     check("bust triggers a rebuy", g.stacks[0] > 0 and g.stacks[1] > 0, str(g.stacks))
 
     g3 = Game(["a", "b", "c"], chips=100, seed=8)
-    check("3-player geometry round-trips", all(g3.hand_seat(g3.physical(s)) == s for s in range(3)))
     while g3.hand.acting_seat is not None:
         g3.hand.step(g3.hand.legal_totals()[0])
     g3.collect()
     check("3-player chips conserved", sum(g3.stacks) == 300, str(g3.stacks))
     g3.new_hand()
-    check("3-player button rotates", g3.button == 1)
+    check("3-player button rotates", g3.button == 1 and g3.hand.button == 1)
 
 
 def test_table_session():
