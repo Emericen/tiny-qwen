@@ -1,10 +1,9 @@
-# The game (rl.poker) is stdlib-only: rules in game.py, tkinter window in table.py.
-# The LLM player (rl.model_player) needs:
-httpx>=0.27
-# The trainer rewrite will need these on the pod (pins encode the 8/22 landmines):
+# rl/poker.py is stdlib-only — rules, vocabulary, and a tkinter window.
+# Training (rl/train.py) needs the stack below; pins encode the 8/22 landmines.
 transformers>=5.13
-trl>=1.10
+trl>=1.12          # environment_factory: env methods become tools, get_reward owns the reward
 peft>=0.18
 datasets>=4.0
 accelerate>=1.10
 vllm>=0.17
+# The eval script (not written yet) will add: httpx>=0.27
