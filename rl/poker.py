@@ -1,30 +1,27 @@
 """
-Poker in three files:
+Poker in one file: the rules, and a window to play them in.
 
-    game.py      the rules and the state: cards, scoring, Hand (one episode),
-                 Game (one table: chips, button, score, chat, the clock, and
-                 every view of the state)
-    server.py    a small FastAPI wrapper whose state is a map of Games — SSE
-                 streams views out, POST /act {seat, total} brings actions in;
-                 fish NPCs sit at the bottom as a convenience
-    table.html   a frontend rendering what the server streams (2-player tables)
+    python -m rl.poker             # play a fish in a tkinter window
+    from rl.poker import Game      # the trainer's view: rules only, no GUI
 
-The game does not know who sits behind a seat. Humans, NPCs, and models are
-all just clients that watch the stream and post a number when it is their
-turn; decision policies live with the training code (rl/model_player.py),
-not here. game.py imports nothing above the standard library.
+The game never plays itself and does not know who sits behind a seat.
+Whoever runs the loop — the window at the bottom of this file, an eval
+script, a trainer — asks the acting seat's policy for ONE number and passes
+it to act(). Decision policies live with the training code
+(rl/model_player.py), not here. Nothing above the standard library is
+imported, and tkinter is imported lazily inside main(), so a headless GPU pod
+can import this file for its rules alone.
 
-The engine speaks ONE action: your cumulative chip total for the hand
-(None = fold). check / call / bet / raise / all-in are presentation-layer
-words for particular numbers — labeled_legal() hands every client the words
-WITH their numbers, so nothing ever converts words back. Cards are emoji
-strings ("♠A") internally and ASCII ("As") at the API boundary.
+The one action is your cumulative chip total for the hand (None = fold).
+check / call / bet / raise / all-in are presentation-layer words for
+particular numbers — labeled_legal() hands every consumer the words WITH
+their numbers, so nothing ever converts words back. Cards are emoji strings
+("♠A") internally and ASCII ("As") in observations.
 
 DEVIATION (documented): every all-in re-opens the action, even below a full
 raise — real poker's incomplete-raise rule is dropped for legibility.
 """
 
-import asyncio
 import itertools
 import random
 from collections import Counter
@@ -45,7 +42,7 @@ SUIT_ASCII = {"♣": "c", "♦": "d", "♥": "h", "♠": "s"}
 
 
 def card_ascii(card: str) -> str:
-    """'♠A' -> 'As', '♥10' -> 'Th' — the format the API boundary speaks."""
+    """'♠A' -> 'As', '♥10' -> 'Th' — the format observations speak."""
     rank = card[1:]
     return ("T" if rank == "10" else rank) + SUIT_ASCII[card[0]]
 
@@ -242,9 +239,9 @@ class Hand:
 
 def labeled_legal(hand: Hand) -> list[dict]:
     """The acting seat's menu: poker words for particular numbers. Every entry
-    carries its number ("total", None = fold) — clients post that back
-    verbatim, so nothing anywhere converts words to numbers. "n" is display
-    detail: the call cost, or the raise total."""
+    carries its number ("total", None = fold) — consumers hand that number
+    straight to act(), so nothing anywhere converts words to numbers. "n" is
+    display detail: the call cost, or the raise total."""
     seat = hand.acting_seat
     match, escalation = hand.legal_totals()
     cost = match - hand.bets[seat]
@@ -270,26 +267,60 @@ def labeled_legal(hand: Hand) -> list[dict]:
     return menu
 
 
+def render(observation: dict) -> str:
+    """One observation as the text a reading player sees. Same job as
+    labeled_legal — game vocabulary, not model plumbing: no system prompt, no
+    tool schema, no API. Every legal total is printed, so a player names a
+    number and nothing anywhere converts words back."""
+    you = observation["you"]
+    small_blind, big_blind = observation["blinds"]
+    seats = len(observation["names"])
+    kind = "Heads-up" if seats == 2 else f"{seats}-player"
+    lines = [f"{kind} no-limit hold'em. Blinds {small_blind}/{big_blind}. 1 bb = {big_blind} chips."]
+    lines.append(f"You are {observation['names'][you]} (seat {you}).")
+    lines.append(f"Your hole cards: {' '.join(observation['hole'])}")
+    lines.append(f"Street: {STREETS[observation['street']]}. "
+                 f"Board: {' '.join(observation['board']) or '(none yet)'}")
+    lines.append(f"Pot: {observation['pot']}. Your stack: {observation['stacks'][you]}. "
+                 f"Committed so far: {observation['bets'][you]}.")
+    if observation["legal"]:
+        lines.append("Legal totals (your cumulative chips for this hand):")
+        for entry in observation["legal"]:
+            if entry["total"] is None:
+                lines.append("  fold — give up the hand (total: null)")
+            elif entry["action"] == "allin":
+                lines.append(f"  all-in — total {entry['total']}")
+            elif entry["action"] in ("check", "call"):
+                cost = entry["total"] - observation["bets"][you]
+                word = "check" if cost == 0 else f"call {cost} more"
+                lines.append(f"  {word} — total {entry['total']}")
+            else:
+                lines.append(f"  raise ({entry['label']}) — total {entry['total']}")
+        low, high = observation["escalation"] or (None, None)
+        if low is not None and low != high:
+            lines.append(f"  any raise total from {low} to {high} is also legal")
+    if observation["talk"]:
+        if observation["chat"]:
+            lines.append("Table talk so far:")
+            lines.extend(f"{entry['who']}: {entry['text']}" for entry in observation["chat"])
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
-# Game: one table — chips, button, score, chat, the clock, the views
+# Game: one table — chips, button, score, chat, narration, observations
 # ---------------------------------------------------------------------------
 
 
 class Game:
     """The game across hands at one table, any number of seats. Owns the
-    chips, rotates the button, keeps the score and the chat thread, runs the
-    clock, and serves every view of itself. It does NOT know who sits behind
-    a seat: every action arrives from outside as give(seat, total), whether
-    the sender is a browser, an NPC, or a model. Consumers learn of changes
-    via a version counter: await wait_past(v)."""
+    chips, rotates the button, keeps the score and the chat thread, and
+    narrates what happens. It does NOT play itself: whoever runs the loop
+    asks the acting seat's policy for a number and passes it to act()."""
 
-    def __init__(self, names: list[str], chips: int = 200, seed: int = 0,
-                 talk: bool = True, auto_deal: bool = False, pause: float = 2.4):
+    def __init__(self, names: list[str], chips: int = 200, seed: int = 0, talk: bool = True):
         self.names = list(names)
         self.n = len(self.names)
         self.talk = talk
-        self.auto_deal = auto_deal  # next hand on a timer, vs on request_new()
-        self.pause = pause  # seconds a finished hand stays up when auto-dealing
         self.chips = chips
         self.seed = seed
         self.stacks = [chips] * self.n
@@ -298,11 +329,6 @@ class Game:
         self.hand_no = 0
         self.button = 0  # rotates every hand; Hand derives blinds and turn order from it
         self.hand: Hand | None = None
-        self.version = 0
-        self._changed = asyncio.Condition()
-        self._actions: asyncio.Queue = asyncio.Queue()  # (seat, total) via give()
-        self._new_request = asyncio.Event()
-        self._base_key = None
         self.new_hand()
 
     # -- the chat thread: append-only ground truth ---------------------------
@@ -340,65 +366,18 @@ class Game:
             self.totals[i] += deltas[i] / BIG_BLIND
         return deltas
 
-    # -- change signal: no registry, just a version --------------------------
+    # -- the action ----------------------------------------------------------
 
-    async def _notify(self):
-        async with self._changed:
-            self.version += 1
-            self._changed.notify_all()
-
-    async def wait_past(self, version: int) -> int:
-        """Park until the table has changed past `version`; return the new one."""
-        async with self._changed:
-            await self._changed.wait_for(lambda: self.version > version)
-            return self.version
-
-    # -- inputs from the server ----------------------------------------------
-
-    def give(self, seat: int, total: int | None):
-        """An action arrives for `seat`. Accepted only when it is that seat's
-        turn — anything else is a stale or confused client and is dropped."""
-        if self.hand.acting_seat == seat:
-            self._actions.put_nowait((seat, total))
-
-    async def post_chat(self, seat: int, text: str):
-        if 0 <= seat < self.n and text.strip():
-            self.say(seat, text.strip())
-            await self._notify()
-
-    def request_new(self):
-        self._new_request.set()
-
-    # -- the clock -----------------------------------------------------------
-
-    async def run(self):
-        """The table runs itself: park until the acting seat's number arrives,
-        apply it, broadcast. Who produced the number is not the game's business."""
-        await self._notify()
-        while True:
-            hand = self.hand
-            if hand.acting_seat is None:  # hand over: deal the next one
-                if self.auto_deal:
-                    await asyncio.sleep(self.pause)
-                else:
-                    await self._new_request.wait()
-                    self._new_request.clear()
-                self.new_hand()
-                await self._notify()
-                continue
-            seat, total = await self._actions.get()
-            if seat != hand.acting_seat:
-                continue  # queued before the turn moved on
-            try:
-                self._apply(seat, total)
-            except ValueError:
-                continue  # an illegal number from a stale view; keep waiting
-            await self._notify()
-
-    def _apply(self, seat: int, total: int | None):
+    def act(self, total: int | None):
+        """One action for the acting seat: apply the number, narrate it, and
+        settle the hand if that ended it. Raises ValueError on an illegal
+        total or a finished hand."""
         hand = self.hand
+        seat = hand.acting_seat
+        if seat is None:
+            raise ValueError("hand is over — call new_hand()")
         match, escalation = hand.legal_totals()
-        cost = match - hand.bets[hand.acting_seat]
+        cost = match - hand.bets[seat]
         if total is None:  # narrate with the word the number means
             word = "fold"
         elif total == match:
@@ -424,49 +403,168 @@ class Game:
         winners = ", ".join(f"{self.names[i]} +{d}" for i, d in enumerate(deltas) if d > 0)
         self.line(None, f"{winners} chips ({how}).", "deal")
 
-    # -- views ---------------------------------------------------------------
+    # -- observations --------------------------------------------------------
 
-    def _street_base(self) -> list[int]:
-        """bets snapshot at street start, for drawing carried-pot vs live bets."""
-        key = (self.hand_no, self.hand.street)
-        if self._base_key != key:
-            self._base_key = key
-            self._base = self.hand.bets.copy()
-        return self._base
-
-    def state(self, for_seat: int | None) -> dict:
-        """One consumer's snapshot. for_seat None = spectator (v1: sees all
-        holes); a seat number sees its own cards until showdown, plus its menu
-        and prices when it is that seat's turn."""
+    def observe(self, seat: int) -> dict:
+        """What `seat` may know, in ASCII vocabulary — the thing a policy
+        (model prompt, eval log) consumes. Prices and the menu are present
+        only when it is that seat's turn."""
         hand = self.hand
-        done = hand.acting_seat is None
-        base = [0] * self.n if done else self._street_base()
-        show = [for_seat is None or done or p == for_seat for p in range(self.n)]
-        your_turn = for_seat is not None and hand.acting_seat == for_seat
-        match, escalation = hand.legal_totals() if your_turn else (None, range(0))
+        acting = hand.acting_seat == seat
+        match, escalation = hand.legal_totals() if acting else (None, range(0))
         return {
-            "hand_no": self.hand_no,
-            "watch": for_seat is None,
-            "you": for_seat,
             "names": self.names,
+            "you": seat,
             "blinds": [SMALL_BLIND, BIG_BLIND],
             "street": hand.street,
             "board": [card_ascii(c) for c in hand.revealed()],
-            "pot": sum(base),  # carried pot only — live bets are drawn at the seats
+            "hole": [card_ascii(c) for c in hand.holes[seat]],
             "stacks": list(hand.stacks),
-            "bets": [hand.bets[p] - base[p] for p in range(self.n)],
-            "hole": [
-                [card_ascii(c) for c in hand.holes[p]] if show[p] else ["?", "?"]
-                for p in range(self.n)
-            ],
-            "button": self.button,
-            "to_act": hand.acting_seat,
-            "your_turn": your_turn,
+            "bets": list(hand.bets),
+            "pot": sum(hand.bets),
             "match": match,
             "escalation": [escalation.start, escalation[-1]] if escalation else None,
-            "legal": labeled_legal(hand) if your_turn else [],
-            "done": done,
-            "totals_bb": [round(t, 1) for t in self.totals],
-            "chat": [{"who": e["who"], "text": e["text"], "kind": e["kind"]} for e in self.chat[-60:]],
+            "legal": labeled_legal(hand) if acting else [],
+            "chat": [{"who": e["who"], "text": e["text"]} for e in self.chat if e["kind"] == "talk"][-8:],
             "talk": self.talk,
         }
+
+# ---------------------------------------------------------------------------
+# the window: one loop owns the game, the fish, and the human
+# ---------------------------------------------------------------------------
+
+FELT, RIM, DARK, INK, DIM, GOLD = "#0e4d28", "#083318", "#071d10", "#e8f2ea", "#9fc4aa", "#face0a"
+CARD_W, CARD_H = 46, 64
+rng = random.Random()
+
+
+def fish_decide(hand):
+    """A calling station with an occasional min-raise, for liveliness."""
+    match, escalation = hand.legal_totals()
+    if escalation and rng.random() < 0.25:
+        return escalation.start
+    return match
+
+
+def main():
+    import tkinter as tk  # lazy: a headless pod imports this file for the rules alone
+
+    game = Game(["you", "fish"], chips=200, seed=rng.randrange(10**6))
+    root = tk.Tk()
+    root.title("tiny-qwen poker")
+    root.configure(bg=DARK)
+    root.geometry("+60+60")
+    canvas = tk.Canvas(root, width=560, height=380, bg=FELT, highlightbackground=RIM, highlightthickness=6)
+    canvas.grid(row=0, column=0, padx=10, pady=10)
+    buttons = tk.Frame(root, bg=DARK)
+    buttons.grid(row=1, column=0, pady=(0, 12))
+    chat_box = tk.Text(root, width=34, bg="#06240f", fg=INK, relief="flat", font=("Menlo", 11),
+                       state="disabled", wrap="word", padx=8, pady=8)
+    chat_box.grid(row=0, column=1, padx=(0, 10), pady=10, sticky="ns")
+    entry = tk.Entry(root, bg="#0d2f1c", fg=INK, insertbackground=INK, relief="flat")
+    entry.grid(row=1, column=1, padx=(0, 10), pady=(0, 12), sticky="ew")
+    flag = tk.IntVar()
+    picked = []
+
+    def draw_card(x, y, card, hidden=False):
+        if card is None:  # empty board slot
+            canvas.create_rectangle(x, y, x + CARD_W, y + CARD_H, outline="#2c7a4a", dash=(3, 2))
+            return
+        if hidden:
+            canvas.create_rectangle(x, y, x + CARD_W, y + CARD_H, fill="#1d5f8a", outline="white", width=2)
+            return
+        canvas.create_rectangle(x, y, x + CARD_W, y + CARD_H, fill="white", outline="#cccccc")
+        color = "#c0392b" if card[0] in "♥♦" else "#1c1c1c"
+        canvas.create_text(x + CARD_W / 2, y + 22, text=card[1:], fill=color, font=("Helvetica", 20, "bold"))
+        canvas.create_text(x + CARD_W / 2, y + 46, text=card[0], fill=color, font=("Helvetica", 16))
+
+    def draw_row(cards, y, hidden=False):
+        x0 = 280 - (len(cards) * (CARD_W + 8) - 8) / 2
+        for i, card in enumerate(cards):
+            draw_card(x0 + i * (CARD_W + 8), y, card, hidden=hidden)
+
+    def render(show_all=False):
+        hand = game.hand
+        canvas.delete("all")
+        draw_row(hand.holes[1], 24, hidden=not show_all)
+        draw_row(hand.revealed() + [None] * (5 - len(hand.revealed())), 158)
+        draw_row(hand.holes[0], 292)
+        for seat, y in ((1, 108), (0, 276)):
+            mark = " ·D" if game.button == seat else ""
+            arrow = "→ " if hand.acting_seat == seat else ""
+            bet = f" · bet {hand.bets[seat]}" if hand.bets[seat] else ""
+            text = f"{arrow}{game.names[seat]}{mark} · stack {hand.stacks[seat]}{bet}"
+            canvas.create_text(280, y, text=text, fill=INK if hand.acting_seat == seat else DIM,
+                               font=("Helvetica", 13))
+        if sum(hand.bets):
+            canvas.create_text(280, 136, text=f"pot {sum(hand.bets)}", fill=GOLD, font=("Helvetica", 13, "bold"))
+        render_chat()
+        root.update()
+
+    def render_chat():
+        chat_box.configure(state="normal")
+        chat_box.delete("1.0", "end")
+        for line in game.chat[-24:]:
+            if line["kind"] == "talk":
+                text = f"{line['who']}: {line['text']}"
+            elif line["kind"] == "act":
+                text = f"{line['who']} · {line['text']}"
+            else:
+                text = line["text"]
+            chat_box.insert("end", text + "\n")
+        chat_box.see("end")
+        chat_box.configure(state="disabled")
+
+    def clear_buttons():
+        for widget in buttons.winfo_children():
+            widget.destroy()
+
+    def ask_human():
+        clear_buttons()
+        for item in labeled_legal(game.hand):
+            text = item["label"] if item["n"] is None else f"{item['label']} {item['n']}"
+            command = lambda t=item["total"]: (picked.append(t), flag.set(flag.get() + 1))
+            tk.Button(buttons, text=text, command=command).pack(side="left", padx=3)
+
+    def send_chat(_event):
+        text = entry.get().strip()
+        entry.delete(0, "end")
+        if text:
+            game.say(0, text)
+            render_chat()
+
+    def play():
+        while True:
+            hand = game.hand
+            while hand.acting_seat is not None:
+                render()
+                if hand.acting_seat == 0:
+                    ask_human()
+                    root.wait_variable(flag)
+                    game.act(picked.pop())
+                else:
+                    clear_buttons()
+                    root.after(600, lambda: flag.set(flag.get() + 1))
+                    root.wait_variable(flag)
+                    game.act(fish_decide(hand))
+            render(show_all=True)
+            clear_buttons()
+            tk.Button(buttons, text="Next hand", command=lambda: flag.set(flag.get() + 1)).pack()
+            root.wait_variable(flag)
+            game.new_hand()
+
+    def start():
+        try:
+            play()
+        except tk.TclError:
+            pass  # window closed mid-hand
+
+    entry.bind("<Return>", send_chat)
+    root.protocol("WM_DELETE_WINDOW", root.destroy)
+    root.lift()
+    root.after(50, start)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
